@@ -56,6 +56,42 @@ These were decided up front so that every milestone builds on the same foundatio
 - v1 keeps a per-user "focused case". A new complaint while no case is focused creates a case. Replies while a case is in `GATHERING_CONTEXT` or `WAITING_FOR_USER` go to that case.
 - Once there are several active cases (M13), an LLM classifier returns `{case_id | new_case | ambiguous}`. If the result is ambiguous, the bot asks with buttons. It never guesses when a decision is being applied.
 
+### D8. Case facts, provenance, and optimistic locking (decided in M1)
+- `case_facts` is **append-only**. The current value of a key is its latest row, and a JSON `null` clears it. Facts are never updated in place, so the history of where each value came from is kept (Invariant 1).
+- Some facts are mirrored into `support_cases` columns for easy querying (`merchant_name`, `merchant_domain`, `issue_type`, `issue_summary`, `desired_resolution`, `order_number`, `order_date`, `support_email`). `cases.service.set_fact` is the **only** writer of those columns, so a column always equals the latest fact for its key. `update_fields` accepts only operational fields (`gmail_thread_id`, `auto_reply_enabled`).
+- `support_cases.version` is SQLAlchemy's `version_id_col`: every UPDATE bumps it, and a write based on a stale read raises `ConcurrentCaseUpdateError`. The caller rolls back and retries the unit of work.
+- `focused` is a boolean guarded by a partial unique index (`user_id WHERE focused`, portable to SQLite), so each user has at most one focused case. `focus_case` moves focus, and closing a case clears it.
+- The log tables (`case_facts`, `case_transitions`) use integer ids so their rows have a total order. Entity tables use UUIDs.
+- Services take an `AsyncSession` and never commit. The caller owns the transaction (`Database.transaction()`).
+
+---
+
+## Case state machine
+
+Defined in `app/cases/state_machine.py` (`ALLOWED_TRANSITIONS`). This table mirrors it.
+
+| From | Allowed to |
+|---|---|
+| `GATHERING_CONTEXT` | `READY_TO_DRAFT` |
+| `READY_TO_DRAFT` | `WAITING_FOR_USER_APPROVAL`, `GATHERING_CONTEXT` |
+| `WAITING_FOR_USER_APPROVAL` | `READY_TO_SEND` (Send pressed), `READY_TO_DRAFT` (redraft), `GATHERING_CONTEXT` |
+| `READY_TO_SEND` | `WAITING_FOR_SUPPORT` (sent), `WAITING_FOR_USER_APPROVAL` (send failed or needs attention) |
+| `WAITING_FOR_SUPPORT` | `PROCESSING_SUPPORT_REPLY`, `READY_TO_DRAFT` (follow-up, M14), `RESOLVED` |
+| `PROCESSING_SUPPORT_REPLY` | `WAITING_FOR_USER`, `READY_TO_REPLY`, `WAITING_FOR_SUPPORT` (e.g. auto-acknowledgement), `RESOLVED` |
+| `WAITING_FOR_USER` | `READY_TO_REPLY`, `WAITING_FOR_SUPPORT`, `RESOLVED` |
+| `READY_TO_REPLY` | `WAITING_FOR_USER_APPROVAL`, `WAITING_FOR_SUPPORT` (routine auto-reply, M12) |
+| `RESOLVED` | `PROCESSING_SUPPORT_REPLY` (support wrote again), `WAITING_FOR_USER` (user reopened) |
+| `CANCELLED` | none (terminal) |
+| `ERROR` | any active status (explicit recovery, reason required), `CANCELLED` |
+
+Additional rules:
+- Every **active** status (all except `RESOLVED`, `CANCELLED` and `ERROR`) can also move to `CANCELLED` or `ERROR`.
+- Cancelling stops tracking the case. **Nothing is sent to support**, including from `WAITING_FOR_SUPPORT`. From M7 on, a cancel while an email is `sending` must be handled by the caller (D2).
+- A resolved case can be reopened (user decision, M1). `resolved_at` is set on entering `RESOLVED` and cleared on leaving it.
+- There are no self-transitions. Editing a draft keeps the case in `WAITING_FOR_USER_APPROVAL`; the new version lives in `outbound_emails`.
+- Case creation is logged as a transition from `NULL` to `GATHERING_CONTEXT`.
+- The state machine checks legality only. Preconditions such as "an approval record exists" belong to the caller (D2).
+
 ---
 
 ## Core tables (introduced over time)
@@ -64,8 +100,8 @@ These were decided up front so that every milestone builds on the same foundatio
 |---|---|---|
 | `users` | M1 | `telegram_user_id` (unique), display name, signature name |
 | `support_cases` | M1 | Spec fields, plus `version` (optimistic locking) and `focused` |
-| `case_facts` | M1 | Provenance: `case_id, key, value(JSON), source, source_ref, confidence` |
-| `case_transitions` | M1 | Audit log: from, to, reason, event_id, at (Invariant 8) |
+| `case_facts` | M1 | Append-only provenance (D8): `case_id, user_id, key, value(JSON), source, source_ref, confidence` |
+| `case_transitions` | M1 | Audit log: from, to, reason, actor, event_id, at (Invariant 8). FK on `event_id` added in M2 |
 | `case_messages` | M5 | Chat log for LLM context. Not workflow state. |
 | `events` | M2 | Inbox and job queue (D1) |
 | `pending_actions` | M3 | Button actions (D3) |

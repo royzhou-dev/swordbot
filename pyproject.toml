@@ -10,6 +10,10 @@ dependencies = [
     "pydantic>=2.9",
     "pydantic-settings>=2.5",
     "structlog>=24.4",
+    "sqlalchemy[asyncio]>=2.0.36",
+    "alembic>=1.14",
+    "asyncpg>=0.30",
+    "aiosqlite>=0.20",
 ]
 
 [dependency-groups]
@@ -44,3 +48,6 @@ plugins = ["pydantic.mypy"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+markers = [
+    "postgres: runs against Postgres; skipped unless TEST_DATABASE_URL is set",
+]

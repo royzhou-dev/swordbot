@@ -12,6 +12,9 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 COPY app ./app
+# Migrations run as a release step: `alembic upgrade head` (never at app startup).
+COPY alembic.ini ./
+COPY migrations ./migrations
 
 RUN useradd --create-home appuser
 USER appuser

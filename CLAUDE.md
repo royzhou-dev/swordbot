@@ -14,7 +14,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 | # | Milestone | Status |
 |---|---|---|
 | M0 | Scaffold: uv, FastAPI, config, structlog, `/health`, Dockerfile, `.env.example` | done |
-| M1 | DB + `SupportCase` + explicit state machine + Alembic | not started |
+| M1 | DB + `SupportCase` + explicit state machine + Alembic | done |
 | M2 | Event inbox/job queue + worker + idempotency | not started |
 | M3 | Telegram adapter (webhook + local polling, auth, buttons via `pending_actions`) | not started |
 | M4 | `LLMClient` abstraction (OpenAI + fake) | not started |
@@ -57,7 +57,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 - Telegram and Gmail use thin `httpx` clients (no python-telegram-bot or google-api-python-client). See PLAN D4 before adding any dependency.
 - All schema changes go through Alembic migrations. Never call `create_all` at startup.
 - Typed exceptions per integration (`GmailTemporaryError`, `GmailAuthenticationError`, `LLMTemporaryError`, `InvalidAgentDecisionError`, …). Transient errors are retried with backoff; permanent errors mark the event `dead` and notify the user.
-- Layout follows `app/{api,agent,cases,events,email,telegram,web,llm,tools,db}/` plus `tests/{unit,integration}/` (see the SPEC).
+- Layout follows `app/{api,agent,cases,events,email,telegram,web,llm,tools,db,users}/` plus `tests/{unit,integration}/` (see the SPEC).
 
 ## Commands
 
@@ -67,7 +67,9 @@ Keep this section accurate as milestones land. The `scripts/` entries arrive wit
 uv sync                                  # install deps
 uv run uvicorn app.main:app --reload     # run API + worker
 uv run alembic upgrade head              # migrate
-uv run pytest                            # tests
+uv run alembic revision --autogenerate -m "..."   # new migration (review it; then `alembic check`)
+uv run pytest                            # tests (SQLite)
+TEST_DATABASE_URL=postgresql+asyncpg://swordbot:swordbot@localhost:5432/swordbot_test uv run pytest  # + Postgres
 uv run ruff check . && uv run ruff format --check . && uv run mypy app
 uv run python scripts/telegram_poll.py   # local Telegram polling (instead of webhook)
 uv run python scripts/gmail_auth.py      # one-time Gmail OAuth → refresh token

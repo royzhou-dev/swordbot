@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: swordbot
+          POSTGRES_PASSWORD: swordbot
+          POSTGRES_DB: swordbot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U swordbot"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Runs every DB test against Postgres as well as SQLite.
+      TEST_DATABASE_URL: postgresql+asyncpg://swordbot:swordbot@localhost:5432/swordbot_test
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+      - name: Install dependencies (Python version from .python-version)
+        run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy app
+      - run: uv run pytest -rs
