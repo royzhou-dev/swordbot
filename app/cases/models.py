@@ -7,7 +7,6 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
-    BigInteger,
     Date,
     Float,
     ForeignKey,
@@ -15,13 +14,13 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
-    Uuid,
     false,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import (
+    LOG_ID,
     Base,
     StrEnumType,
     TimestampMixin,
@@ -29,10 +28,6 @@ from app.db.base import (
     UUIDPrimaryKeyMixin,
     utcnow,
 )
-
-# Append-only log tables use an integer id so rows have a total order even when
-# two are written within the same clock tick.
-_LOG_ID = BigInteger().with_variant(Integer, "sqlite")
 
 
 class CaseStatus(StrEnum):
@@ -120,7 +115,7 @@ class CaseFact(Base):
 
     __tablename__ = "case_facts"
 
-    id: Mapped[int] = mapped_column(_LOG_ID, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(LOG_ID, primary_key=True, autoincrement=True)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("support_cases.id"))
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     key: Mapped[str] = mapped_column(String(64))
@@ -140,7 +135,7 @@ class CaseTransition(Base):
 
     __tablename__ = "case_transitions"
 
-    id: Mapped[int] = mapped_column(_LOG_ID, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(LOG_ID, primary_key=True, autoincrement=True)
     case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("support_cases.id"), index=True)
     user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
     # NULL for the row written when the case is created.
@@ -148,6 +143,6 @@ class CaseTransition(Base):
     to_status: Mapped[CaseStatus] = mapped_column(StrEnumType(CaseStatus))
     reason: Mapped[str] = mapped_column(Text)
     actor: Mapped[TransitionActor] = mapped_column(StrEnumType(TransitionActor, length=16))
-    # The event that caused the transition. The foreign key to `events` arrives in M2.
-    event_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    # The event that caused the transition, if any.
+    event_id: Mapped[int | None] = mapped_column(LOG_ID, ForeignKey("events.id"))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)

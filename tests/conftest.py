@@ -13,6 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import Environment, Settings
 from app.db.models import Base, User
 from app.db.session import Database
+from app.events import service as event_service
+from app.events.models import EventSource, EventType
+from app.events.schemas import NewEvent
 from app.main import create_app
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,8 +23,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture
 def settings() -> Settings:
-    # _env_file=None keeps a developer's local .env out of tests.
-    return Settings(_env_file=None, environment=Environment.TEST)
+    # _env_file=None keeps a developer's local .env out of tests. Worker tests
+    # build their own worker, so the app's background worker stays off.
+    return Settings(_env_file=None, environment=Environment.TEST, worker_enabled=False)
 
 
 @pytest.fixture
@@ -108,3 +112,15 @@ async def user(session: AsyncSession) -> User:
     session.add(u)
     await session.commit()
     return u
+
+
+@pytest.fixture
+async def event_id(session: AsyncSession, user: User) -> int:
+    """The id of a stored event for `user`, for tests that record which event caused a change."""
+    new_event = NewEvent(
+        user_id=user.id, type=EventType.USER_MESSAGE, source=EventSource.DEV, external_id="fixture"
+    )
+    stored_id = await event_service.enqueue(session, new_event)
+    await session.commit()
+    assert stored_id is not None
+    return stored_id

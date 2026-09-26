@@ -93,11 +93,14 @@ def test_ready_to_send_is_reached_only_from_approval_or_recovery() -> None:
 
 @pytest.mark.parametrize(("from_status", "to_status"), ALLOWED_PAIRS, ids=_ids(ALLOWED_PAIRS))
 async def test_allowed_transition_applies_and_is_logged(
-    session: AsyncSession, user: User, from_status: CaseStatus, to_status: CaseStatus
+    session: AsyncSession,
+    user: User,
+    event_id: int,
+    from_status: CaseStatus,
+    to_status: CaseStatus,
 ) -> None:
     case = await _case_in(session, user, from_status)
     version_before = case.version
-    event_id = uuid.uuid4()
 
     record = await transition(
         session, case, to_status, reason="test", actor=TransitionActor.AGENT, event_id=event_id

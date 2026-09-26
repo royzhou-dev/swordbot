@@ -27,9 +27,8 @@ async def _new_case(session: AsyncSession, user: User) -> SupportCase:
 
 
 async def test_create_case_starts_gathering_context_with_audit_row(
-    session: AsyncSession, user: User
+    session: AsyncSession, user: User, event_id: int
 ) -> None:
-    event_id = uuid.uuid4()
     case = await service.create_case(
         session, user_id=user.id, actor=TransitionActor.USER, event_id=event_id
     )

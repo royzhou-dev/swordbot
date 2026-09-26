@@ -52,7 +52,7 @@ async def create_case(
     user_id: uuid.UUID,
     actor: TransitionActor,
     reason: str = "case created",
-    event_id: uuid.UUID | None = None,
+    event_id: int | None = None,
 ) -> SupportCase:
     """Create a case in the initial status and log its creation as the first transition."""
     case = SupportCase(id=uuid.uuid4(), user_id=user_id, status=INITIAL_STATUS)

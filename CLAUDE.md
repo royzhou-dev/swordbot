@@ -5,7 +5,7 @@ The user reports an order problem over Telegram. The assistant gathers context (
 **What it is:** a durable workflow engine where an LLM proposes the next permitted action and chat is the user interface. It is **not** "an LLM conversation with Gmail access." The database owns all workflow state; the LLM context window owns none.
 
 - Full spec (authoritative for product behavior): [docs/SPEC.md](docs/SPEC.md)
-- Milestones, architectural decisions D1–D7, and open decisions: [docs/PLAN.md](docs/PLAN.md)
+- Milestones, architectural decisions D1–D9, and open decisions: [docs/PLAN.md](docs/PLAN.md)
 
 ## Milestone status
 
@@ -15,7 +15,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 |---|---|---|
 | M0 | Scaffold: uv, FastAPI, config, structlog, `/health`, Dockerfile, `.env.example` | done |
 | M1 | DB + `SupportCase` + explicit state machine + Alembic | done |
-| M2 | Event inbox/job queue + worker + idempotency | not started |
+| M2 | Event inbox/job queue + worker + idempotency | done |
 | M3 | Telegram adapter (webhook + local polling, auth, buttons via `pending_actions`) | not started |
 | M4 | `LLMClient` abstraction (OpenAI + fake) | not started |
 | M5 | Tool registry with risk levels + agent runtime + intake conversation | not started |
@@ -39,7 +39,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 
 ## Architecture rules
 
-- **Event flow:** a transport adapter (Telegram or Gmail webhook) validates the request, normalizes it into an `Event`, and inserts it into the `events` table (unique `(source, external_id)`), then returns 200. An in-process worker claims the event, loads the case, runs the handler/agent, persists, and stops. Adapters never call the LLM or contain workflow logic. See PLAN D1.
+- **Event flow:** a transport adapter (Telegram or Gmail webhook) validates the request, normalizes it into a `NewEvent`, calls `events.service.enqueue` (deduplicated on `(source, external_id)`), then returns 200. An in-process worker claims the event, loads the case, runs the handler/agent, persists, and stops. A user's events run one at a time, in order. The handler runs in the same transaction that marks the event done. Adapters never call the LLM or contain workflow logic. See PLAN D1.
 - **Scheduled work** (follow-ups, Gmail watch renewal) = `events` rows with a future `run_at`. Never use `sleep` or a long-running wait.
 - **State transitions** go only through `cases/state_machine.py`, which validates against `ALLOWED_TRANSITIONS` and writes to `case_transitions`. The LLM may *recommend* a transition; code decides.
 - **Send guard (D2):** `outbound_emails` status runs `awaiting_approval → approved → sending → sent`. An atomic conditional UPDATE to `sending` is required before calling Gmail. An approval is bound to the exact draft (`body_hash`), so any edit requires re-approval. A crashed `sending` is never re-sent automatically.
@@ -53,7 +53,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 ## Stack & conventions
 
 - Python **3.12+**, managed by **uv**. Development uses 3.14 (`py -3.14`, pinned in `.python-version`). `uv` is on the user PATH (installed in `C:\Users\royzh\AppData\Roaming\Python\Python314\Scripts`). If a shell that started before the PATH change can't find it, call `uv` by its full path. Plain `python` in Git Bash is 2.7; use `uv run` or `py -3.14` instead. Docker Desktop provides the local Postgres (`docker compose up -d db`). FastAPI, Pydantic v2, pydantic-settings, SQLAlchemy 2.x async, Alembic, httpx, structlog, openai SDK, google-auth.
-- Postgres in production (`asyncpg`); SQLite (`aiosqlite`) is allowed for local development and tests. Use only portable types: `JSON`, `Uuid`, tz-aware `DateTime`. No Postgres-only features in the models. The one exception is `SKIP LOCKED`, which is isolated in the event service with a SQLite fallback.
+- Postgres in production (`asyncpg`); SQLite (`aiosqlite`) is allowed for local development and tests. Use only portable types: `JSON`, `Uuid`, tz-aware `DateTime`. No Postgres-only features in the models. The exceptions are `SKIP LOCKED` and `ON CONFLICT DO NOTHING`, both isolated in `app/events/service.py` (SQLite ignores the first and supports the second).
 - Telegram and Gmail use thin `httpx` clients (no python-telegram-bot or google-api-python-client). See PLAN D4 before adding any dependency.
 - All schema changes go through Alembic migrations. Never call `create_all` at startup.
 - Typed exceptions per integration (`GmailTemporaryError`, `GmailAuthenticationError`, `LLMTemporaryError`, `InvalidAgentDecisionError`, …). Transient errors are retried with backoff; permanent errors mark the event `dead` and notify the user.
@@ -61,7 +61,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 
 ## Commands
 
-Keep this section accurate as milestones land. The `scripts/` entries arrive with M3 and M7.
+Keep this section accurate as milestones land. `telegram_poll.py` arrives with M3 and `gmail_auth.py` with M7.
 
 ```bash
 uv sync                                  # install deps
@@ -71,6 +71,7 @@ uv run alembic revision --autogenerate -m "..."   # new migration (review it; th
 uv run pytest                            # tests (SQLite)
 TEST_DATABASE_URL=postgresql+asyncpg://swordbot:swordbot@localhost:5432/swordbot_test uv run pytest  # + Postgres
 uv run ruff check . && uv run ruff format --check . && uv run mypy app
+uv run python scripts/inject_event.py --type user_message   # push a synthetic event (dev)
 uv run python scripts/telegram_poll.py   # local Telegram polling (instead of webhook)
 uv run python scripts/gmail_auth.py      # one-time Gmail OAuth → refresh token
 ```

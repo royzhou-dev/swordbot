@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import DateTime, Dialect, MetaData, String, TypeDecorator, Uuid
+from sqlalchemy import BigInteger, DateTime, Dialect, Integer, MetaData, String, TypeDecorator, Uuid
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 # Deterministic constraint names, so migrations can reference them and SQLite
@@ -21,6 +21,12 @@ NAMING_CONVENTION = {
     "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
     "pk": "pk_%(table_name)s",
 }
+
+
+# Primary key type for append-only log and queue tables, so rows have a total
+# order even when two are written within the same clock tick. SQLite only
+# autoincrements an INTEGER primary key.
+LOG_ID = BigInteger().with_variant(Integer, "sqlite")
 
 
 def utcnow() -> datetime:

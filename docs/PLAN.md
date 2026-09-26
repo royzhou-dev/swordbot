@@ -14,10 +14,15 @@ These were decided up front so that every milestone builds on the same foundatio
 
 ### D1. Durable event inbox + in-process worker
 - Webhooks (Telegram, Gmail Pub/Sub) only **validate, normalize, and insert** a row into `events`, then return 200 right away. They never call the LLM or Gmail inline.
-- `events` has a unique constraint on `(source, external_id)`, for example `("telegram", update_id)` or `("gmail", message_id)`. A duplicate delivery hits the unique constraint and is dropped. This is the first layer of idempotency.
+- `events` has a unique constraint on `(source, external_id)`, for example `("telegram", update_id)` or `("gmail", message_id)`. A duplicate delivery is dropped by `INSERT … ON CONFLICT DO NOTHING` (supported by both Postgres and SQLite). This is the first layer of idempotency.
 - A background worker runs inside the FastAPI process (started from the app lifespan). It claims pending events whose `run_at <= now()`. On Postgres it uses `SELECT … FOR UPDATE SKIP LOCKED`; on SQLite, a single worker with a conditional status update.
-- Events for the **same case are processed serially**: the worker never processes two events for one case at the same time.
-- Retries: transient errors reschedule with backoff (`attempts`, `run_at`, `last_error`). Permanent errors, or too many attempts, mark the event `dead` and notify the user. Events are never silently dropped.
+- **Events for the same user are processed serially, in arrival order** (decided in M2; stricter than per case). Routing a message to a case happens inside the handler, so serializing per case would let two quick messages race to create or route cases. For a single-user bot this costs nothing noticeable, and the serialization key is just `events.user_id`.
+  - The claim query picks the lowest `id` that is due and not blocked. An event is blocked while the same user has a `processing` event, or an older `pending` event that is due or waiting to retry. An event scheduled for the future blocks nothing until it is due.
+  - A partial unique index (`user_id WHERE status = 'processing'`) makes two in-flight events for one user impossible even under a race.
+- **Claims are leases.** Claiming sets `status='processing'`, a fresh `claim_token`, `locked_until = now + lease` (5 minutes), and increments `attempts`, so a crash mid-handler still counts. A handler is cut off at 90% of the lease. An expired lease (the process crashed or hung) is recovered as a failed attempt. Every later write to the event checks the `claim_token`, so a worker whose lease expired cannot complete it.
+- **The handler and the event's completion share one transaction.** The handler's DB writes, including follow-on events it enqueues, commit together with `status='done'` or roll back together. External side effects can still repeat after a crash (at-least-once), which is why sends are guarded separately (D2).
+- Retries: any exception is transient unless it is a `PermanentEventError`. Transient errors reschedule with exponential backoff (`attempts`, `run_at`, `last_error`): 15s, 30s, 1m, … capped at 30m, for 8 attempts, which is about 30 minutes (decided in M2; configurable). Permanent errors, or running out of attempts, mark the event `dead` and notify the user. Events are never silently dropped. `last_error` keeps only the exception type for third-party errors, because their messages can contain tokens or user content.
+- On graceful shutdown, in-flight events get a short grace period and are then released without counting the attempt. After a hard kill they wait for their lease to expire.
 - **Scheduled work (follow-ups, Gmail watch renewal) uses the same table** with a future `run_at`, so there is no separate scheduler. This is the "persist scheduled work behind an abstraction" requirement.
 - Consequence: the deploy target must run a long-lived process (Railway, Render, Fly.io, or a Cloud Run service with min-instances=1 and CPU always allocated). This is documented in the README.
 
@@ -64,6 +69,11 @@ These were decided up front so that every milestone builds on the same foundatio
 - The log tables (`case_facts`, `case_transitions`) use integer ids so their rows have a total order. Entity tables use UUIDs.
 - Services take an `AsyncSession` and never commit. The caller owns the transaction (`Database.transaction()`).
 
+### D9. Integer event ids (decided in M2)
+- `events.id` is an autoincrementing integer, like the D8 log tables, not a UUID. The worker's per-user ordering needs a total order that doesn't depend on clock resolution.
+- `case_transitions.event_id` became an integer FK to `events.id` in migration `0002`. It was a UUID placeholder in M1 that nothing wrote to.
+- Ids can have gaps on Postgres (a deduplicated insert still uses a sequence value). Nothing relies on them being contiguous.
+
 ---
 
 ## Case state machine
@@ -101,9 +111,9 @@ Additional rules:
 | `users` | M1 | `telegram_user_id` (unique), display name, signature name |
 | `support_cases` | M1 | Spec fields, plus `version` (optimistic locking) and `focused` |
 | `case_facts` | M1 | Append-only provenance (D8): `case_id, user_id, key, value(JSON), source, source_ref, confidence` |
-| `case_transitions` | M1 | Audit log: from, to, reason, actor, event_id, at (Invariant 8). FK on `event_id` added in M2 |
+| `case_transitions` | M1 | Audit log: from, to, reason, actor, event_id (FK to `events`, M2), at (Invariant 8) |
 | `case_messages` | M5 | Chat log for LLM context. Not workflow state. |
-| `events` | M2 | Inbox and job queue (D1) |
+| `events` | M2 | Inbox and job queue (D1, D9): type, source, external_id, payload, status, attempts, run_at, lease |
 | `pending_actions` | M3 | Button actions (D3) |
 | `outbound_emails` | M6 | Drafts, approvals and sends (D2) |
 | `email_messages` | M10 | Inbound emails being tracked: unique `gmail_message_id`, thread, case, classification |
@@ -125,9 +135,9 @@ Additional rules:
 - **Verify:** unit tests cover every allowed transition and reject disallowed ones. `alembic upgrade head` works on both SQLite and Postgres.
 
 ### M2. Event layer
-- `events/models.py` (`EventType`, `Event` Pydantic model), `events/service.py` (insert that dedupes, claim, complete, fail and retry, schedule), `events/worker.py` (lifespan task, per-case serialization), and a handler registry in `events/handlers.py`.
+- `events/models.py` (the `events` table, `EventType`, `EventSource`, `EventStatus`), `events/schemas.py` (`NewEvent` from adapters, `ClaimedEvent` for handlers), `events/service.py` (deduplicating `enqueue` that also schedules, `claim_next`, `complete`, `fail`, `release`, `recover_expired`), `events/worker.py` (lifespan task, per-user serialization, leases), and a handler registry in `events/handlers.py`.
 - `scripts/inject_event.py` to push a synthetic event during local development.
-- **Verify:** tests show that a duplicate `(source, external_id)` insert is a no-op, that a failing handler retries with backoff and then goes `dead`, and that two events for one case never run at the same time.
+- **Verify:** tests show that a duplicate `(source, external_id)` insert is a no-op, that a failing handler retries with backoff and then goes `dead`, and that two events for one user never run at the same time.
 
 ### M3. Telegram adapter
 - `telegram/client.py` (sendMessage, editMessageText, answerCallbackQuery), `telegram/keyboards.py` (builds from `pending_actions`), `api/telegram.py` webhook.

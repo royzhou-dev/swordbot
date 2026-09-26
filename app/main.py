@@ -6,6 +6,9 @@ from fastapi import FastAPI
 from app.api import health
 from app.config import Settings, get_settings
 from app.db.session import Database
+from app.events.handlers import build_registry
+from app.events.service import EventPolicy
+from app.events.worker import EventWorker, LoggingDeadEventNotifier
 from app.logging import configure_logging, get_logger
 
 
@@ -18,10 +21,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # The engine connects lazily. The schema is managed by Alembic, never created here.
         database = Database.from_url(settings.database_url)
         app.state.database = database
+        worker: EventWorker | None = None
+        if settings.worker_enabled:
+            worker = EventWorker(
+                database,
+                build_registry(),
+                EventPolicy.from_settings(settings),
+                notifier=LoggingDeadEventNotifier(),
+                concurrency=settings.worker_concurrency,
+                poll_interval=settings.worker_poll_interval_seconds,
+            )
+            worker.start()
+        # Adapters call `app.state.worker.wake()` after enqueueing, when a worker runs.
+        app.state.worker = worker
         get_logger(__name__).info("app_started", environment=settings.environment.value)
         try:
             yield
         finally:
+            if worker is not None:
+                await worker.stop()
             await database.dispose()
             get_logger(__name__).info("app_stopped")
 

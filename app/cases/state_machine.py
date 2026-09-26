@@ -9,7 +9,6 @@ needing an approval record before `READY_TO_SEND` (PLAN D2), belong to the
 caller that requests the move.
 """
 
-import uuid
 from collections.abc import Mapping
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -83,7 +82,7 @@ async def transition(
     *,
     reason: str,
     actor: TransitionActor,
-    event_id: uuid.UUID | None = None,
+    event_id: int | None = None,
 ) -> CaseTransition:
     """Move `case` to `to_status`, record the audit row, and bump `version`.
 
@@ -125,6 +124,6 @@ async def transition(
         from_status=from_status.value,
         to_status=to_status.value,
         actor=actor.value,
-        event_id=str(event_id) if event_id else None,
+        event_id=event_id,
     )
     return record

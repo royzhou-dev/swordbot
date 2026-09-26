@@ -2,7 +2,7 @@
 
 A personal customer-support assistant. You describe an order problem to a Telegram bot ("My DoorDash order was missing the fries"). The bot works out the details, drafts an email to the merchant's support team, and sends it from your Gmail only after you press **Send**. When support replies, the bot picks the case back up. It asks you before making any consequential decision, such as accepting store credit instead of a refund.
 
-> Status: early development. The scaffold and the case domain (database, state machine, facts with provenance) exist; there is no chat or email integration yet. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
+> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance) and the event queue with its worker exist; there is no chat or email integration yet. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
 ## Architecture
 
@@ -51,7 +51,29 @@ To change the schema:
 3. Review the generated file by hand. Keep it portable (no Postgres-only types), since it also runs on SQLite.
 4. `uv run alembic upgrade head`, then `uv run alembic check` should report no differences. The test suite checks this too.
 
-Main tables so far: `users`, `support_cases` (status, fact-backed fields, optimistic-lock `version`), `case_facts` (append-only facts with `source` provenance) and `case_transitions` (audit log of every status change). The allowed status transitions are listed in [docs/PLAN.md](docs/PLAN.md#case-state-machine).
+Main tables so far: `users`, `support_cases` (status, fact-backed fields, optimistic-lock `version`), `case_facts` (append-only facts with `source` provenance), `case_transitions` (audit log of every status change) and `events` (the inbox and job queue, below). The allowed status transitions are listed in [docs/PLAN.md](docs/PLAN.md#case-state-machine).
+
+## Events and the worker
+
+Every input becomes a row in `events` first: Telegram updates and Gmail notifications (from M3 and M10), and scheduled work such as follow-ups. A worker inside the app process then handles each one ([app/events/](app/events/), PLAN D1):
+
+- **Duplicates are dropped.** `(source, external_id)` is unique, so a redelivered Telegram update or Gmail notification is ignored.
+- **One at a time per user, in order.** A user's events never run concurrently, and a newer event waits while an older one is retrying. Different users' events run in parallel on Postgres.
+- **Retries.** A failing event is retried with backoff (15s, 30s, 1m, … capped at 30m) for 8 attempts, about 30 minutes, and is then marked `dead` and reported. Errors that can never succeed on retry (`PermanentEventError`, such as an invalid payload) go straight to `dead`.
+- **Crash safety.** A claimed event holds a 5-minute lease. If the process dies, the event is retried once the lease expires. A handler's database writes commit only together with the event being marked done. On a normal shutdown, in-flight events are handed back immediately.
+- **Scheduling.** Future work is an event with a later `run_at`.
+
+To push a synthetic event while the app is running (it is created for `TELEGRAM_ALLOWED_USER_ID` unless you pass `--telegram-user-id`):
+
+```bash
+uv run python scripts/inject_event.py --type user_message --external-id demo-1
+uv run python scripts/inject_event.py --type user_message --external-id demo-1   # "duplicate"
+uv run python scripts/inject_event.py --type user_message --delay 20             # runs ~20s later
+```
+
+Until M3, the only handler logs `user_message_received`. Other event types go `dead` with `UnknownEventTypeError`. Inspect the queue with `docker compose exec db psql -U swordbot -c "select id, type, status, attempts, run_at, last_error from events order by id"`.
+
+With SQLite the worker handles one event at a time, and a long handler holds SQLite's single write lock. Use Postgres for anything beyond tests.
 
 ## Environment variables
 
@@ -62,6 +84,12 @@ Main tables so far: `users`, `support_cases` (status, fact-backed fields, optimi
 | `APP_BASE_URL` | Public HTTPS URL of the deployment, used to register webhooks |
 | `DATABASE_URL` | SQLAlchemy async URL: `postgresql+asyncpg://…`, or `sqlite+aiosqlite:///…` for local development |
 | `TEST_DATABASE_URL` | Tests only. A disposable Postgres database; when set, DB tests also run against Postgres |
+| `WORKER_ENABLED` | Run the event worker in the app process (default `true`) |
+| `WORKER_CONCURRENCY` | Events processed at once, across different users (default `4`; always 1 on SQLite) |
+| `WORKER_POLL_INTERVAL_SECONDS` | How often the worker checks for due events (default `1.0`) |
+| `EVENT_MAX_ATTEMPTS` | Attempts before an event is marked `dead` (default `8`) |
+| `EVENT_RETRY_BASE_SECONDS`, `EVENT_RETRY_MAX_SECONDS` | Exponential backoff start and cap (defaults `15` and `1800`) |
+| `EVENT_LEASE_SECONDS` | How long a claimed event may run before it is presumed crashed (default `300`) |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | LLM access and model name |
 | `TELEGRAM_BOT_TOKEN` | Token from @BotFather |
 | `TELEGRAM_WEBHOOK_SECRET` | Secret that Telegram echoes back in `X-Telegram-Bot-Api-Secret-Token` |
