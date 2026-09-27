@@ -3,7 +3,8 @@
 Logs are JSON in production and human-readable in development. A redaction
 processor masks values whose key looks sensitive (tokens, secrets, email bodies,
 auth headers) so they never reach log output, even if a caller passes them by
-mistake.
+mistake. It also blanks anything shaped like a Telegram bot token inside any
+string value, because the token is part of every Bot API URL.
 """
 
 import logging
@@ -21,6 +22,12 @@ _SENSITIVE_KEY = re.compile(
     re.IGNORECASE,
 )
 
+# "<bot id>:<35-character secret>", as issued by @BotFather.
+_BOT_TOKEN = re.compile(r"(?<!\d)\d{5,}:[A-Za-z0-9_-]{30,}")
+
+# These log full request URLs at INFO, and Telegram URLs contain the bot token.
+_NOISY_URL_LOGGERS = ("httpx", "httpcore")
+
 
 def _redact(value: Any) -> Any:
     if isinstance(value, MutableMapping):
@@ -29,6 +36,8 @@ def _redact(value: Any) -> Any:
         }
     if isinstance(value, list | tuple):
         return type(value)(_redact(v) for v in value)
+    if isinstance(value, str):
+        return _BOT_TOKEN.sub(REDACTED, value)
     return value
 
 
@@ -62,6 +71,8 @@ def configure_logging(level: str = "INFO", *, json_output: bool = True) -> None:
         cache_logger_on_first_use=True,
     )
     logging.basicConfig(level=level.upper(), format="%(message)s")
+    for name in _NOISY_URL_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def get_logger(name: str | None = None) -> structlog.stdlib.BoundLogger:

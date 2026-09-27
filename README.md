@@ -2,7 +2,7 @@
 
 A personal customer-support assistant. You describe an order problem to a Telegram bot ("My DoorDash order was missing the fries"). The bot works out the details, drafts an email to the merchant's support team, and sends it from your Gmail only after you press **Send**. When support replies, the bot picks the case back up. It asks you before making any consequential decision, such as accepting store credit instead of a refund.
 
-> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance) and the event queue with its worker exist; there is no chat or email integration yet. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
+> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, and the Telegram adapter exist. For now the bot only echoes messages back with a test button; the LLM and email come next. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
 ## Architecture
 
@@ -51,7 +51,7 @@ To change the schema:
 3. Review the generated file by hand. Keep it portable (no Postgres-only types), since it also runs on SQLite.
 4. `uv run alembic upgrade head`, then `uv run alembic check` should report no differences. The test suite checks this too.
 
-Main tables so far: `users`, `support_cases` (status, fact-backed fields, optimistic-lock `version`), `case_facts` (append-only facts with `source` provenance), `case_transitions` (audit log of every status change) and `events` (the inbox and job queue, below). The allowed status transitions are listed in [docs/PLAN.md](docs/PLAN.md#case-state-machine).
+Main tables so far: `users`, `support_cases` (status, fact-backed fields, optimistic-lock `version`), `case_facts` (append-only facts with `source` provenance), `case_transitions` (audit log of every status change), `events` (the inbox and job queue, below) and `pending_actions` (the records behind chat buttons). The allowed status transitions are listed in [docs/PLAN.md](docs/PLAN.md#case-state-machine).
 
 ## Events and the worker
 
@@ -71,7 +71,7 @@ uv run python scripts/inject_event.py --type user_message --external-id demo-1  
 uv run python scripts/inject_event.py --type user_message --delay 20             # runs ~20s later
 ```
 
-Until M3, the only handler logs `user_message_received`. Other event types go `dead` with `UnknownEventTypeError`. Inspect the queue with `docker compose exec db psql -U swordbot -c "select id, type, status, attempts, run_at, last_error from events order by id"`.
+A `user_message` event is answered in Telegram, so it needs `TELEGRAM_BOT_TOKEN`; give it text with `--payload '{"text": "hi"}'`. Event types without a handler go `dead` with `UnknownEventTypeError`. Inspect the queue with `docker compose exec db psql -U swordbot -c "select id, type, status, attempts, run_at, last_error from events order by id"`.
 
 With SQLite the worker handles one event at a time, and a long handler holds SQLite's single write lock. Use Postgres for anything beyond tests.
 
@@ -93,7 +93,8 @@ With SQLite the worker handles one event at a time, and a long handler holds SQL
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | LLM access and model name |
 | `TELEGRAM_BOT_TOKEN` | Token from @BotFather |
 | `TELEGRAM_WEBHOOK_SECRET` | Secret that Telegram echoes back in `X-Telegram-Bot-Api-Secret-Token` |
-| `TELEGRAM_ALLOWED_USER_ID` | The only Telegram user the bot responds to |
+| `TELEGRAM_ALLOWED_USER_ID` | The only Telegram user the bot responds to (your numeric id) |
+| `TELEGRAM_API_BASE_URL` | Bot API base URL (default `https://api.telegram.org`) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Gmail OAuth client |
 | `GMAIL_REFRESH_TOKEN` | Produced by the one-time OAuth script (M7) |
 
@@ -105,7 +106,33 @@ _To be written in M7._ Scopes will be `gmail.send` (M7) and `gmail.readonly` (M8
 
 ## Telegram bot setup
 
-_To be written in M3._
+The bot is its own Telegram account, created with @BotFather. You talk to it from your normal account. It can only see messages sent to it directly, and it answers only `TELEGRAM_ALLOWED_USER_ID`; everyone else is ignored without a reply. Chats with bots are not end-to-end encrypted, so order details and email drafts pass through Telegram's servers.
+
+1. In Telegram, message **@BotFather**, send `/newbot`, and pick a display name and a username ending in `bot`. Put the token in `.env` as `TELEGRAM_BOT_TOKEN`.
+2. Send @BotFather `/setjoingroups`, pick your bot, and choose **Disable**, so nobody can add it to a group. The bot ignores group chats anyway.
+3. Open your bot's chat and press **Start**. A bot can't message you until you do.
+4. Find your numeric Telegram user id: run the poller below with `TELEGRAM_ALLOWED_USER_ID` empty and message the bot. The rejection log line shows `sender_id` (never the message). Put it in `TELEGRAM_ALLOWED_USER_ID`.
+5. Set `TELEGRAM_WEBHOOK_SECRET` to a random string of letters, digits, `_` and `-` (webhook mode only, used from M7.5): `py -3.14 -c "import secrets; print(secrets.token_urlsafe(32))"`.
+
+If the token ever leaks, send @BotFather `/revoke` and update `.env`.
+
+**Local development uses polling.** Telegram can only deliver webhooks to a public HTTPS URL, so locally a second process fetches updates:
+
+```bash
+uv run uvicorn app.main:app --reload     # terminal 1: API + worker
+uv run python scripts/telegram_poll.py   # terminal 2: Telegram -> events
+```
+
+The poller deletes any registered webhook first (Telegram refuses polling while one is set) and passes each update through the same code as the webhook. Send the bot a message: it echoes it back with a **Test button**. Pressing the button once confirms it; pressing it again says it is no longer valid.
+
+**Production uses the webhook** `POST /telegram/webhook` (set up in M7.5). It is disabled (404) unless `TELEGRAM_WEBHOOK_SECRET` is set, and rejects requests whose `X-Telegram-Bot-Api-Secret-Token` header doesn't match (401).
+
+How it works ([app/telegram/](app/telegram/), PLAN D1, D3 and D10):
+
+- **Inbound.** Each update is authorized (the allowed user, in a private chat) and stored as a `user_message` or `user_button_action` event, deduplicated on the message or button-press id. Updates that aren't messages or button presses are dropped.
+- **Outbound.** Handlers never call Telegram directly. Each reply, button acknowledgement or button removal is queued as a `telegram_outbound` event in the handler's transaction and delivered by the worker. A Telegram outage retries only the delivery. If a message can't be delivered at all, you get a short notice once Telegram works again.
+- **Buttons.** Each button is a `pending_actions` row; the button carries only its id. A press is accepted once, only from you, only before it expires and only while its case is still in the expected status. Pressing one button closes the others shown with it.
+- **Secrets.** The bot token is part of every Bot API URL, so the `httpx` request logger is kept at WARNING, Telegram errors never include the URL, and anything shaped like a bot token is scrubbed from log values.
 
 ## Deployment
 

@@ -1,15 +1,18 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI
 
-from app.api import health
+from app.api import health, telegram
 from app.config import Settings, get_settings
 from app.db.session import Database
-from app.events.handlers import build_registry
+from app.events.routing import build_registry
 from app.events.service import EventPolicy
-from app.events.worker import EventWorker, LoggingDeadEventNotifier
+from app.events.worker import EventWorker
 from app.logging import configure_logging, get_logger
+from app.telegram.client import HttpTelegramClient, TelegramClient, UnconfiguredTelegramClient
+from app.telegram.notifier import TelegramDeadEventNotifier
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -20,14 +23,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         configure_logging(settings.log_level, json_output=settings.is_production)
         # The engine connects lazily. The schema is managed by Alembic, never created here.
         database = Database.from_url(settings.database_url)
+        app.state.settings = settings
         app.state.database = database
+        http = httpx.AsyncClient()
+        telegram_client: TelegramClient
+        if settings.telegram_bot_token is None:
+            get_logger(__name__).warning("telegram_not_configured")
+            telegram_client = UnconfiguredTelegramClient()
+        else:
+            telegram_client = HttpTelegramClient(
+                settings.telegram_bot_token, http, base_url=settings.telegram_api_base_url
+            )
         worker: EventWorker | None = None
         if settings.worker_enabled:
             worker = EventWorker(
                 database,
-                build_registry(),
+                build_registry(telegram_client),
                 EventPolicy.from_settings(settings),
-                notifier=LoggingDeadEventNotifier(),
+                notifier=TelegramDeadEventNotifier(database),
                 concurrency=settings.worker_concurrency,
                 poll_interval=settings.worker_poll_interval_seconds,
             )
@@ -40,6 +53,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             if worker is not None:
                 await worker.stop()
+            await http.aclose()
             await database.dispose()
             get_logger(__name__).info("app_stopped")
 
@@ -52,6 +66,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None if settings.is_production else "/openapi.json",
     )
     app.include_router(health.router)
+    app.include_router(telegram.router)
     return app
 
 

@@ -1,4 +1,6 @@
-"""Event handlers and the registry that dispatches to them.
+"""The handler registry and the context handlers receive.
+
+Handlers live with their domain; `app.events.routing` wires them up.
 
 A handler receives a `HandlerContext` and its event's payload, already
 validated into the Pydantic model it registered. It runs inside the same
@@ -75,22 +77,7 @@ class HandlerRegistry:
         await route.handler(ctx, payload)
 
 
-# --- Handlers -------------------------------------------------------------------
-
-
 class UnparsedPayload(BaseModel):
-    """Accepts any payload. Used by placeholder handlers until the real schema exists."""
+    """Accepts any payload. For handlers whose payload schema doesn't exist yet, and tests."""
 
     model_config = ConfigDict(extra="allow")
-
-
-async def log_user_message(ctx: HandlerContext, payload: UnparsedPayload) -> None:
-    """Placeholder until M3 replaces it with the Telegram echo handler."""
-    # Only ids are logged, never message content.
-    ctx.log.info("user_message_received")
-
-
-def build_registry() -> HandlerRegistry:
-    registry = HandlerRegistry()
-    registry.register(EventType.USER_MESSAGE, UnparsedPayload, log_user_message)
-    return registry

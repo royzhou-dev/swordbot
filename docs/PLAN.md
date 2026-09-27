@@ -14,7 +14,8 @@ These were decided up front so that every milestone builds on the same foundatio
 
 ### D1. Durable event inbox + in-process worker
 - Webhooks (Telegram, Gmail Pub/Sub) only **validate, normalize, and insert** a row into `events`, then return 200 right away. They never call the LLM or Gmail inline.
-- `events` has a unique constraint on `(source, external_id)`, for example `("telegram", update_id)` or `("gmail", message_id)`. A duplicate delivery is dropped by `INSERT … ON CONFLICT DO NOTHING` (supported by both Postgres and SQLite). This is the first layer of idempotency.
+- `events` has a unique constraint on `(source, external_id)`, for example `("telegram", "message:{chat_id}:{message_id}")`, `("telegram", "callback:{callback_query_id}")` or `("gmail", message_id)`. A duplicate delivery is dropped by `INSERT … ON CONFLICT DO NOTHING` (supported by both Postgres and SQLite). This is the first layer of idempotency.
+  - Telegram keys use message and callback-query ids, not `update_id` (decided in M3). Telegram restarts `update_id` at a random value after a week without updates, so an old id could collide and silently drop a real message. Message ids are never reused within a chat.
 - A background worker runs inside the FastAPI process (started from the app lifespan). It claims pending events whose `run_at <= now()`. On Postgres it uses `SELECT … FOR UPDATE SKIP LOCKED`; on SQLite, a single worker with a conditional status update.
 - **Events for the same user are processed serially, in arrival order** (decided in M2; stricter than per case). Routing a message to a case happens inside the handler, so serializing per case would let two quick messages race to create or route cases. For a single-user bot this costs nothing noticeable, and the serialization key is just `events.user_id`.
   - The claim query picks the lowest `id` that is due and not blocked. An event is blocked while the same user has a `processing` event, or an older `pending` event that is due or waiting to retry. An event scheduled for the future blocks nothing until it is due.
@@ -36,6 +37,7 @@ These were decided up front so that every milestone builds on the same foundatio
 ### D3. Telegram buttons use durable action records
 - Telegram limits `callback_data` to 64 bytes. Each button therefore points to a row in `pending_actions` (`id`, `user_id`, `case_id`, `kind`, `payload`, `status`, `expires_at`), and `callback_data` carries only a short action id.
 - A button press becomes a `USER_BUTTON_ACTION` event carrying that action id. The handler checks that the action is still `open`, belongs to the user, and matches the case's current state, then consumes it. Old or already-used buttons do nothing and reply "this is no longer valid".
+- Details (decided in M3): `callback_data` is `a:` plus the action's UUID in hex (34 bytes). Buttons shown on one message share a `group_id`; consuming one marks the rest `superseded`, so a prompt is answered once. An expired action, or one whose case is no longer in `expected_case_status`, supersedes its whole group, so an old [Send] can never approve a later draft. Consumption is a conditional UPDATE (`open → consumed`) and records `consumed_by_event_id`. Code lives in `app/actions/`.
 
 ### D4. Thin HTTP clients, not SDK frameworks
 - **Telegram**: a small `httpx` async client plus Pydantic models for the Update fields we use. This avoids python-telegram-bot or aiogram, which bring their own event loop and dispatcher that would conflict with our event layer.
@@ -73,6 +75,15 @@ These were decided up front so that every milestone builds on the same foundatio
 - `events.id` is an autoincrementing integer, like the D8 log tables, not a UUID. The worker's per-user ordering needs a total order that doesn't depend on clock resolution.
 - `case_transitions.event_id` became an integer FK to `events.id` in migration `0002`. It was a UUID placeholder in M1 that nothing wrote to.
 - Ids can have gaps on Postgres (a deduplicated insert still uses a sequence value). Nothing relies on them being contiguous.
+
+### D10. Outbound Telegram calls go through the queue (decided in M3)
+- Handlers never call Telegram. They queue each call (send a message, acknowledge a button press, remove a message's buttons) through `TelegramOutbox`. Each call becomes a `TELEGRAM_OUTBOUND` event, written in the handler's transaction, and `TelegramDelivery` makes the call when the worker runs that event.
+- Why: a Telegram outage retries only the delivery, never the handler and (from M5) its LLM calls. A message with buttons is sent only after its `pending_actions` rows are committed. Replies keep their order because a user's events run one at a time.
+- Delivery is at-least-once. A crash between Telegram accepting a message and the commit resends it, which is acceptable for chat. Email has its own guard (D2).
+- Messages are plain text (no `parse_mode`, so there is nothing to escape) and are split at Telegram's 4096 UTF-16-unit limit, with any buttons on the last part.
+- Acknowledging a press and removing buttons are tidy-up calls. If Telegram rejects one ("query is too old", "message is not modified"), it is logged and the event completes. Network errors still retry.
+- When an event goes `dead`, `TelegramDeadEventNotifier` queues a short notice to the user. A failed notice is never itself reported, so failures can't cascade.
+- The bot talks only in private chats, where the chat id equals the user's Telegram id, so replies go to `users.telegram_user_id`.
 
 ---
 
@@ -144,7 +155,8 @@ Additional rules:
 - The webhook checks the `X-Telegram-Bot-Api-Secret-Token` header and `TELEGRAM_ALLOWED_USER_ID`. Unauthorized updates are dropped with a log entry that contains no message content.
 - Local mode: `scripts/telegram_poll.py` long-polls `getUpdates` and feeds updates through **the same** normalization path.
 - A temporary `USER_MESSAGE` handler echoes the message back and shows a test button.
-- **Verify:** a real bot echoes a message and handles a button press end to end in polling mode. Tests cover the auth rejection, duplicate `update_id`, and stale-button handling.
+- Built as: `telegram/ingest.py` (the shared normalization path), `telegram/delivery.py` (outbox and delivery, D10), `telegram/notifier.py` (dead-event notices), `actions/` (`pending_actions` model and service, migration `0003`), `chat/handlers.py` (echo and button handlers), `events/routing.py` (handler wiring). Non-text messages get "I can only read text messages for now." The real webhook is exercised in M7.5; locally only polling is used.
+- **Verify:** a real bot echoes a message and handles a button press end to end in polling mode. Tests cover the auth rejection, duplicate updates, and stale-button handling.
 
 ### M4. LLM layer
 - `llm/client.py`: the `LLMClient` protocol (`complete`, `extract_structured`, `run_agent`), an `OpenAIClient` implementation, and a `FakeLLMClient` for tests. Typed errors: `LLMTemporaryError`, `InvalidAgentDecisionError`.

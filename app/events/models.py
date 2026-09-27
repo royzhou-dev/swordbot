@@ -22,6 +22,8 @@ class EventType(StrEnum):
     USER_BUTTON_ACTION = "user_button_action"
     EMAIL_RECEIVED = "email_received"
     FOLLOW_UP_DUE = "follow_up_due"
+    # One outbound Telegram API call, queued by a handler (PLAN D10).
+    TELEGRAM_OUTBOUND = "telegram_outbound"
 
 
 class EventSource(StrEnum):

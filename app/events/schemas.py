@@ -34,6 +34,29 @@ class NewEvent(BaseModel):
         return value
 
 
+class UserMessagePayload(BaseModel):
+    """`USER_MESSAGE`: something the user wrote in chat."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # None when the message had no text (a photo, sticker, voice note, ...).
+    text: str | None = None
+    telegram_message_id: int | None = None
+
+
+class ButtonPressPayload(BaseModel):
+    """`USER_BUTTON_ACTION`: the user pressed a button."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    # None when the button's data was not a valid action reference.
+    action_id: uuid.UUID | None
+    # Telegram needs the press acknowledged, or the button keeps spinning.
+    callback_query_id: str
+    # The message the button was on, so its buttons can be removed.
+    telegram_message_id: int | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class ClaimedEvent:
     """An immutable snapshot of an event the worker has claimed.

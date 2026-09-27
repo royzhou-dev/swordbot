@@ -7,9 +7,9 @@ transaction, normally through `Database.transaction()`, so one unit of work
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, cast
 
-from sqlalchemy import event
+from sqlalchemy import CursorResult, Result, event
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -29,6 +29,11 @@ def create_engine(url: str) -> AsyncEngine:
             cursor.close()
 
     return engine
+
+
+def rowcount(result: Result[Any]) -> int:
+    """Rows matched by an UPDATE or DELETE (which always produce a CursorResult)."""
+    return cast(CursorResult[Any], result).rowcount
 
 
 class Database:

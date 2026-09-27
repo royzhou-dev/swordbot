@@ -17,15 +17,15 @@ Database-specific code is limited to two statements: the deduplicating insert
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, cast
 
-from sqlalchemy import CursorResult, Result, and_, exists, or_, select, update
+from sqlalchemy import and_, exists, or_, select, update
 from sqlalchemy.dialects import postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from app.config import Settings
 from app.db.base import utcnow
+from app.db.session import rowcount
 from app.events.errors import LostClaimError
 from app.events.models import Event, EventStatus
 from app.events.schemas import ClaimedEvent, NewEvent
@@ -84,11 +84,6 @@ def describe_error(exc: BaseException) -> str:
     if type(exc).__module__.startswith("app.") and str(exc):
         return f"{name}: {exc}"[:_MAX_ERROR_LENGTH]
     return name
-
-
-def _rowcount(result: Result[Any]) -> int:
-    # UPDATE statements always produce a CursorResult.
-    return cast(CursorResult[Any], result).rowcount
 
 
 def _snapshot(event: Event, *, attempts: int, claim_token: uuid.UUID) -> ClaimedEvent:
@@ -206,7 +201,7 @@ async def claim_next(
         )
         .execution_options(synchronize_session=False)
     )
-    if _rowcount(result) == 0:
+    if rowcount(result) == 0:
         return None
     return _snapshot(event, attempts=attempts, claim_token=token)
 
@@ -229,7 +224,7 @@ async def complete(session: AsyncSession, event: ClaimedEvent, *, now: datetime)
         )
         .execution_options(synchronize_session=False)
     )
-    if _rowcount(result) == 0:
+    if rowcount(result) == 0:
         raise LostClaimError(event.id)
 
 
@@ -273,7 +268,7 @@ async def fail(
         .values(changes)
         .execution_options(synchronize_session=False)
     )
-    if _rowcount(result) == 0:
+    if rowcount(result) == 0:
         raise LostClaimError(event.id)
     return EventStatus.DEAD if dead else EventStatus.PENDING
 

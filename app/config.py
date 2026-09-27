@@ -1,10 +1,13 @@
 """Typed application configuration loaded from environment variables / `.env`."""
 
+import re
 from enum import StrEnum
 from functools import lru_cache
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_WEBHOOK_SECRET = re.compile(r"[A-Za-z0-9_-]{1,256}")
 
 
 class Environment(StrEnum):
@@ -41,11 +44,21 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr | None = None
     telegram_webhook_secret: SecretStr | None = None
     telegram_allowed_user_id: int | None = None
+    # Overridable for tests or a self-hosted Bot API server.
+    telegram_api_base_url: str = "https://api.telegram.org"
 
     google_client_id: str | None = None
     google_client_secret: SecretStr | None = None
     google_redirect_uri: str | None = None
     gmail_refresh_token: SecretStr | None = None
+
+    @field_validator("telegram_webhook_secret")
+    @classmethod
+    def _webhook_secret_charset(cls, value: SecretStr | None) -> SecretStr | None:
+        # Telegram's setWebhook only accepts 1-256 characters from this set.
+        if value is not None and not _WEBHOOK_SECRET.fullmatch(value.get_secret_value()):
+            raise ValueError("must be 1-256 characters from A-Z, a-z, 0-9, _ and -")
+        return value
 
     @property
     def is_production(self) -> bool:

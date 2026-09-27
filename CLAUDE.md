@@ -16,7 +16,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 | M0 | Scaffold: uv, FastAPI, config, structlog, `/health`, Dockerfile, `.env.example` | done |
 | M1 | DB + `SupportCase` + explicit state machine + Alembic | done |
 | M2 | Event inbox/job queue + worker + idempotency | done |
-| M3 | Telegram adapter (webhook + local polling, auth, buttons via `pending_actions`) | not started |
+| M3 | Telegram adapter (webhook + local polling, auth, buttons via `pending_actions`) | done |
 | M4 | `LLMClient` abstraction (OpenAI + fake) | not started |
 | M5 | Tool registry with risk levels + agent runtime + intake conversation | not started |
 | M6 | Email drafting + Send/Edit/Cancel approval | not started |
@@ -44,7 +44,8 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 - **State transitions** go only through `cases/state_machine.py`, which validates against `ALLOWED_TRANSITIONS` and writes to `case_transitions`. The LLM may *recommend* a transition; code decides.
 - **Send guard (D2):** `outbound_emails` status runs `awaiting_approval → approved → sending → sent`. An atomic conditional UPDATE to `sending` is required before calling Gmail. An approval is bound to the exact draft (`body_hash`), so any edit requires re-approval. A crashed `sending` is never re-sent automatically.
 - **Tool authorization** is enforced in the tool executor based on `ToolRiskLevel`, not in prompts. `REQUIRES_APPROVAL` tools require an approval record id.
-- **Buttons (D3):** `callback_data` = short `pending_actions.id` only. Validate that the action is open, belongs to this user, and matches the case state, then consume it.
+- **Buttons (D3):** `callback_data` = short `pending_actions.id` only. Validate that the action is open, belongs to this user, and matches the case state, then consume it (`actions.service.consume`).
+- **Telegram replies (D10):** handlers never call Telegram. They queue calls through `TelegramOutbox` (`app/telegram/delivery.py`), which become `telegram_outbound` events delivered by the worker.
 - **LLM:** all calls go through `LLMClient` (`app/llm/client.py`). Outputs that drive the workflow use Pydantic structured output and are validated. Model names come from env. No direct `openai` imports outside `app/llm/`.
 - **Gmail:** send only the minimum email content to the LLM. Parse and trim receipts in code first. Match inbound mail by thread id first, then fall back to headers.
 - Every table row belongs to a `user_id`, even though v1 is single-user.
@@ -61,7 +62,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 
 ## Commands
 
-Keep this section accurate as milestones land. `telegram_poll.py` arrives with M3 and `gmail_auth.py` with M7.
+Keep this section accurate as milestones land. `gmail_auth.py` arrives with M7.
 
 ```bash
 uv sync                                  # install deps
@@ -71,8 +72,8 @@ uv run alembic revision --autogenerate -m "..."   # new migration (review it; th
 uv run pytest                            # tests (SQLite)
 TEST_DATABASE_URL=postgresql+asyncpg://swordbot:swordbot@localhost:5432/swordbot_test uv run pytest  # + Postgres
 uv run ruff check . && uv run ruff format --check . && uv run mypy app
-uv run python scripts/inject_event.py --type user_message   # push a synthetic event (dev)
-uv run python scripts/telegram_poll.py   # local Telegram polling (instead of webhook)
+uv run python scripts/inject_event.py --type user_message --payload '{"text": "hi"}'   # push a synthetic event (dev)
+uv run python scripts/telegram_poll.py   # local Telegram polling (run next to uvicorn; instead of webhook)
 uv run python scripts/gmail_auth.py      # one-time Gmail OAuth → refresh token
 ```
 
