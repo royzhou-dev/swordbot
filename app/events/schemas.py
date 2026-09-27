@@ -57,6 +57,14 @@ class ButtonPressPayload(BaseModel):
     telegram_message_id: int | None = None
 
 
+class DraftEmailPayload(BaseModel):
+    """`DRAFT_EMAIL`: write the first draft of a case's email."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    case_id: uuid.UUID
+
+
 @dataclass(frozen=True, slots=True)
 class ClaimedEvent:
     """An immutable snapshot of an event the worker has claimed.

@@ -1,15 +1,24 @@
 """Test doubles for external services."""
 
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.base import utcnow
+from app.events.models import EventSource, EventType
+from app.events.schemas import ClaimedEvent
 from app.llm.client import Message
 from app.llm.errors import InvalidAgentDecisionError
+from app.logging import get_logger
 from app.telegram.client import ReplyMarkup
+from app.telegram.delivery import TelegramOutbox
 from app.telegram.schemas import SentMessage, TelegramChat, TelegramUser
+from app.tools.registry import ToolContext
 
 
 @dataclass(frozen=True)
@@ -154,6 +163,44 @@ class FakeLLMClient:
         return reply
 
 
+def tool_context() -> ToolContext:
+    """A context for tools that touch neither the database nor Telegram."""
+    event = ClaimedEvent(
+        id=1,
+        user_id=uuid.uuid4(),
+        case_id=None,
+        type=EventType.USER_MESSAGE,
+        source=EventSource.DEV,
+        external_id="x",
+        payload={},
+        attempts=1,
+        claim_token=uuid.uuid4(),
+        created_at=datetime(2026, 9, 26, tzinfo=UTC),
+    )
+    return ToolContext(
+        session=cast(AsyncSession, None),
+        event=event,
+        now=event.created_at,
+        log=get_logger("test"),
+        outbox=cast(TelegramOutbox, None),
+    )
+
+
+class Clock:
+    """Real time plus an offset. Events are stamped with real time when ingested,
+    so a frozen clock would never see them as due.
+    """
+
+    def __init__(self) -> None:
+        self.offset = timedelta(0)
+
+    def __call__(self) -> datetime:
+        return utcnow() + self.offset
+
+    def advance(self, delta: timedelta) -> None:
+        self.offset += delta
+
+
 # --- Raw Telegram updates ---------------------------------------------------------
 
 
@@ -170,7 +217,7 @@ def message_update(
         "message_id": message_id,
         "date": 1_790_000_000,
         "chat": {"id": sender_id, "type": chat_type},
-        "from": {"id": sender_id, "is_bot": is_bot, "first_name": "Test"},
+        "from": {"id": sender_id, "is_bot": is_bot, "first_name": "Test", "last_name": "User"},
     }
     if text is not None:
         message["text"] = text
@@ -189,7 +236,7 @@ def callback_update(
 ) -> dict[str, Any]:
     query: dict[str, Any] = {
         "id": callback_id,
-        "from": {"id": sender_id, "is_bot": False, "first_name": "Test"},
+        "from": {"id": sender_id, "is_bot": False, "first_name": "Test", "last_name": "User"},
         "chat_instance": "ci",
     }
     if data is not None:

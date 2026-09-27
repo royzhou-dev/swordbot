@@ -28,8 +28,8 @@ These were decided up front so that every milestone builds on the same foundatio
 - Consequence: the deploy target must run a long-lived process (Railway, Render, Fly.io, or a Cloud Run service with min-instances=1 and CPU always allocated). This is documented in the README.
 
 ### D2. The outbound email state machine is the send guard
-- Every outbound email is an `outbound_emails` row. Its status moves `draft → awaiting_approval → approved → sending → sent | failed | cancelled`.
-- An approval is tied to one exact draft, using `body_hash` plus subject and recipient. Any edit creates a new draft version that needs new approval.
+- Every outbound email is an `outbound_emails` row, one per version. Its status moves `awaiting_approval → approved → sending → sent | failed | needs_attention`. A version still awaiting approval can become `superseded` (replaced by a newer version, or discarded when the case goes back to intake), and an unsent one `cancelled` (decided in M6: there is no separate `draft` status, because a draft is shown for approval as soon as it is saved).
+- An approval is tied to one exact draft through `content_hash`, a sha256 of recipient, subject and body together. Any edit creates a new version that needs new approval.
 - To send, the code first runs an atomic conditional update (`UPDATE … SET status='sending' WHERE id=? AND status='approved'`). If no rows were updated, it does not send. This is what makes a duplicate button press or webhook harmless (Invariant 5).
 - Each email gets a client-generated RFC 822 `Message-ID` before sending. If the process crashes while an email is `sending`, the email is **never automatically re-sent**. The system checks Gmail Sent for that Message-ID (once the read scope exists, from M8 on). Before that, it marks the email `needs_attention` and asks the user.
 - The `send_support_email` tool refuses to run without a valid approval record. This check lives in code, not in the prompt (Invariant 2).
@@ -92,6 +92,24 @@ These were decided up front so that every milestone builds on the same foundatio
 - Output that still fails validation after the one repair retry raises `InvalidAgentDecisionError`, a `PermanentEventError`: the event goes `dead` and the user is notified. This caps an attempt at 2 calls, where worker retries could have made up to 16.
 - Requests use the OpenAI Responses API with `store=False` and send the full context every time. The database owns conversation state (`previous_response_id` is never used).
 - The SDK retries brief failures itself (`OPENAI_MAX_RETRIES`, default 1, with `OPENAI_TIMEOUT_SECONDS`, default 45). The worst case for one structured call (45s x 2 tries x 2 for the repair) stays under the handler cutoff.
+- LLM-facing schemas stay within OpenAI strict mode (decided in M5): the action union is a plain `Union` of models tagged by a required `tool: Literal[...]` (a Pydantic discriminated union emits `oneOf`, which strict mode rejects); fields have no defaults; and limits such as maximum lengths are validators, not schema keywords, so a violation goes through the repair retry.
+
+### D12. An intake turn is one decision carrying facts and an action (decided in M5)
+- Each user message is one agent turn. The `IntakeDecision` holds both the facts stated in the message (`facts`) and the next action (`ask_user`, `reply_to_user` or `finish_intake`), so a typical turn costs **one** LLM call rather than an extraction call plus a question call.
+- Recording facts is not a tool. It is our own state, written by code with provenance (`user_message`, `source_ref = telegram:<message_id>`). Tools are for talking to the user and, from M8, for lookups.
+- The runtime hands every decision to a review hook **before** the action runs. The intake hook validates and records the facts, recomputes the missing requirements in code (`agent/policies.py`) and may replace the action: nothing missing means `finish_intake` (show the summary, move to `READY_TO_DRAFT`); the model finishing while something is missing means a code-written fallback question. So the model never decides readiness, and a question about something just answered is never sent.
+- Facts are checked before they are recorded: an order number must appear in the user's message, an order date must be ISO and not in the future, an unknown issue type becomes `other`, and an unchanged value is not appended again.
+- An order is identified by an order number **or** an order date (user decision, M5). Relative dates resolve against `USER_TIMEZONE`.
+- Cases open lazily: only when the decision records a fact or asks a question. Small talk opens no case.
+- (M6) Every issue type also requires `support_email`, asked last. Like an order number, it is recorded only if it appears in the user's message, and it must look like an address. `signature_name` is an optional fact with the same check.
+
+### D13. Drafting and approval (decided in M6)
+- **Drafting is its own event.** When intake completes, it moves the case to `READY_TO_DRAFT` and queues a `DRAFT_EMAIL` event (deduplicated per causing event) in the same transaction. Two worst-case structured calls in one handler could exceed the handler cutoff, and a drafting failure should retry only the drafting. The handler does nothing unless the case is still `READY_TO_DRAFT`, so a duplicate is harmless. If a draft event dies, any later message to the `READY_TO_DRAFT` case queues it again.
+- **The model writes the subject and body; code does the rest.** The recipient is the `support_email` fact. The sign-off (`Thank you,` plus a name) is added by code: the case's `signature_name` fact if the user gave one, else `users.signature_name` (nothing sets it yet), else the Telegram name (`users.display_name`, first and last name, refreshed at ingest). Drafts with placeholders or their own sign-off fail validation and get the repair retry. Each version stores `body_text` (as drafted) and `body` (as sent), so code can re-address or re-sign a draft without another model call.
+- **The approval record is the consumed Send button.** Buttons under a draft carry `{outbound_email_id, content_hash}`. A Send press consumes the action (D3), then `drafts.approve` runs one conditional UPDATE (`status = awaiting_approval AND content_hash = <button's hash>`) and stores `approved_by_action_id`. `EmailApprovalVerifier` (for M7's `send_support_email`) re-checks that whole chain from the database and recomputes the hash from the stored content.
+- **Text never approves.** A message while a draft waits goes to a draft-review turn whose actions are only `draft_support_email` and `reply_to_user`. Facts in the message are recorded as in intake. If a fact changed but the model only replied, code re-issues the current text as a new version, so the old Send button can't approve a stale recipient or signature. If a change leaves something required missing, the draft is superseded and the case goes back to `GATHERING_CONTEXT`.
+- **Buttons.** A new version supersedes the old version's button group and removes it from the chat. If the waiting draft has no open buttons (after Edit then "never mind", or Cancel then "Keep it"), code shows it again with fresh buttons. Draft buttons don't expire; the hash binding is the guard.
+- At most one email per case is live (`awaiting_approval`, `approved` or `sending`), enforced by a partial unique index.
 
 ---
 
@@ -131,10 +149,10 @@ Additional rules:
 | `support_cases` | M1 | Spec fields, plus `version` (optimistic locking) and `focused` |
 | `case_facts` | M1 | Append-only provenance (D8): `case_id, user_id, key, value(JSON), source, source_ref, confidence` |
 | `case_transitions` | M1 | Audit log: from, to, reason, actor, event_id (FK to `events`, M2), at (Invariant 8) |
-| `case_messages` | M5 | Chat log for LLM context. Not workflow state. |
+| `case_messages` | M5 | Chat log for LLM context (last 20 per turn). Not workflow state. |
 | `events` | M2 | Inbox and job queue (D1, D9): type, source, external_id, payload, status, attempts, run_at, lease |
 | `pending_actions` | M3 | Button actions (D3) |
-| `outbound_emails` | M6 | Drafts, approvals and sends (D2) |
+| `outbound_emails` | M6 | Drafts, approvals and sends (D2, D13): one row per version |
 | `email_messages` | M10 | Inbound emails being tracked: unique `gmail_message_id`, thread, case, classification |
 | `gmail_sync_state` | M10 | `history_id` and watch expiration per user |
 
@@ -178,12 +196,28 @@ Additional rules:
 - Build the `LLMClient` in the app lifespan (`build_llm_client`) and pass it to the handlers.
 - Handler flow for `USER_MESSAGE`: route to a case (D7), extract or merge facts (provenance = `user_message`), compute missing fields in code, and ask one short question per turn.
 - **Verify:** an integration test with the fake LLM covers the complaint, one follow-up question, the answer, and the case reaching `READY_TO_DRAFT` with facts sourced correctly.
+- Built as (see D12):
+  - `tools/registry.py`: `ToolRiskLevel`, `Tool`, `ToolRegistry`, `ToolContext`, and `ToolExecutor` with an `ApprovalVerifier` (deny-all until M6). `tools/chat_tools.py` holds `ask_user` and `reply_to_user` (`LOW_RISK_WRITE`, terminal), and `tools/errors.py` the typed errors, all permanent.
+  - `agent/runtime.py`: `run_turn` with the review hook and `MAX_STEPS = 4`. `agent/schemas.py`: `IntakeDecision`, `FactUpdate`, `StopAction`. `agent/policies.py`: `IssueType`, `IntakeField`, `Requirement`, `REQUIRED`, `missing_requirements`, fallback questions. `agent/prompts.py`: the intake prompt, `render_data_block` and the context. `agent/intake.py`: `IntakeAgent`, fact validation and the summary.
+  - `cases/routing.py`: M5 routing. A message goes to the focused case while it is `GATHERING_CONTEXT` or `READY_TO_DRAFT`. `READY_TO_DRAFT` still takes corrections, and a new requirement sends the case back to `GATHERING_CONTEXT`.
+  - `cases/messages.py` and `CaseMessage`: the `case_messages` chat log. Migration `0004` also deletes leftover M3 `echo_test` buttons.
+  - `chat/handlers.py`: `/start`, `/help` and `/cancel` are handled in code, with no LLM call. `/cancel` shows **[Yes, cancel] [Keep it]** (`ActionKind.CANCEL_CASE` / `KEEP_CASE`), bound to the case's current status. The M3 echo is gone.
+  - Wiring: `build_llm_client` runs in the lifespan, and the client is closed on shutdown. A blank `OPENAI_API_KEY` now counts as unset instead of crashing startup. New setting `USER_TIMEZONE` (dependency `tzdata`). `scripts/llm_smoke.py --intake` checks the real API against the `IntakeDecision` schema.
 
 ### M6. Drafting and approval
 - A `draft_support_email` tool (LOW_RISK_WRITE) creates an `outbound_emails` row. Telegram shows the draft with **[Send] [Edit] [Cancel]**.
 - Edit: the user types changes, the LLM revises, and the result is a new draft version with a new approval requirement. Cancel moves the case to `CANCELLED` after the user confirms.
 - Until M9, the support email address comes from the user (the bot asks for it). Emails are signed with the user's configured name.
 - **Verify:** tests show that text like "yeah looks good" never approves anything (only the button does), that an edit invalidates the old Send button, and that a double-pressed Send creates only one approval.
+- Built as (see D13):
+  - `email/models.py` (`OutboundEmail`, `OutboundEmailStatus`, migration `0005`), `email/drafts.py` (`content_hash`, `compose_body`, `create_version`, `approve`, `discard_live`), `email/approvals.py` (`DraftButtonPayload`, `EmailApprovalVerifier`), `email/errors.py`.
+  - `tools/email_tools.py`: `draft_support_email` (`LOW_RISK_WRITE`, terminal), `present_draft`, `retire_buttons`, `ensure_draft_buttons`, `signature_for`.
+  - `agent/drafting.py`: `DraftingAgent.draft` (the `DRAFT_EMAIL` handler) and `.review` (draft-review turn, `DraftReviewDecision`), `request_draft`. `agent/facts.py`: fact checks and recording shared by intake and review (moved out of `intake.py`). Prompts: `draft_messages`, `review_messages`.
+  - `cases/routing.py`: `route_message` returns a `Stage` (intake, draft review, approved). `chat/handlers.py`: `SEND_EMAIL`, `EDIT_DRAFT`, `CANCEL_DRAFT` buttons; cancelling a case cancels its unsent email.
+  - Intake: `support_email` is a requirement for every issue type; `signature_name` is optional. The M5 summary is replaced by a short "drafting now" notice.
+  - Users: `display_name` holds the Telegram first and last name, refreshed at ingest (`TelegramUser.full_name`).
+  - Send in M6 stops at `approved` / `READY_TO_SEND` with a message saying sending isn't built yet. M7 queues the send from the Send handler and wires `EmailApprovalVerifier` into `send_support_email`. Note for M7: the From header's display name should follow the case's signature name, so a different-name order doesn't reveal the usual name.
+  - `scripts/llm_smoke.py --draft` checks `DraftSupportEmail` against the real API; a unit test checks that all agent schemas fit OpenAI strict mode.
 
 ### M7. Gmail send — Phase 1 complete
 - `email/gmail_client.py` (token refresh, `send_message`), `scripts/gmail_auth.py`, and the `send_support_email` tool (REQUIRES_APPROVAL) using the D2 send guard.
@@ -240,4 +274,4 @@ Additional rules:
 1. ~~**Local Postgres (M1)**~~ Decided: Docker Desktop, running `docker compose up -d db`.
 2. **Hosting platform (M7.5):** must run a long-lived process (D1). Suggested options: Railway or Fly.io.
 3. **Web search provider (M9):** OpenAI's built-in web search tool, Brave Search API, or Tavily. This affects cost and adds another API key.
-4. **Signature/display name** used in emails (M6).
+4. ~~**Signature/display name** used in emails (M6)~~ Decided: the Telegram name by default, overridable per case (for orders placed under another name). See D13.

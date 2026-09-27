@@ -15,7 +15,10 @@ from app.cases.models import CaseStatus, TransitionActor
 from app.users.models import User
 
 NOW = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
-TWO_BUTTONS = [ButtonSpec(ActionKind.ECHO_TEST, "Yes"), ButtonSpec(ActionKind.ECHO_TEST, "No")]
+TWO_BUTTONS = [
+    ButtonSpec(ActionKind.CANCEL_CASE, "Yes"),
+    ButtonSpec(ActionKind.KEEP_CASE, "No"),
+]
 
 
 async def _group(session: AsyncSession, user: User, **kwargs: object) -> list[PendingAction]:

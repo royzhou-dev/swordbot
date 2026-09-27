@@ -24,6 +24,9 @@ class EventType(StrEnum):
     FOLLOW_UP_DUE = "follow_up_due"
     # One outbound Telegram API call, queued by a handler (PLAN D10).
     TELEGRAM_OUTBOUND = "telegram_outbound"
+    # Draft a case's email once intake has everything (M6). Its own event, so a
+    # drafting failure retries only the drafting.
+    DRAFT_EMAIL = "draft_email"
 
 
 class EventSource(StrEnum):

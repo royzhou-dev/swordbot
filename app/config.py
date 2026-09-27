@@ -3,6 +3,7 @@
 import re
 from enum import StrEnum
 from functools import lru_cache
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -22,6 +23,8 @@ class Settings(BaseSettings):
     environment: Environment = Environment.DEVELOPMENT
     log_level: str = "INFO"
     app_base_url: str | None = None
+    # IANA name, e.g. America/Los_Angeles. Resolves "tonight" and "yesterday" to dates.
+    user_timezone: str = "UTC"
 
     database_url: str = "postgresql+asyncpg://swordbot:swordbot@localhost:5432/swordbot"
 
@@ -65,9 +68,22 @@ class Settings(BaseSettings):
             raise ValueError("must be 1-256 characters from A-Z, a-z, 0-9, _ and -")
         return value
 
+    @field_validator("user_timezone")
+    @classmethod
+    def _known_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(f"unknown timezone {value!r}; use an IANA name") from exc
+        return value
+
     @property
     def is_production(self) -> bool:
         return self.environment is Environment.PRODUCTION
+
+    @property
+    def user_zoneinfo(self) -> ZoneInfo:
+        return ZoneInfo(self.user_timezone)
 
 
 @lru_cache

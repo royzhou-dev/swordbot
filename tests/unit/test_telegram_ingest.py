@@ -136,3 +136,18 @@ async def test_button_press_with_foreign_data_is_still_queued_for_a_reply(
     await _ingest(database, callback_update(5, sender_id=OWNER, callback_id="q", data="junk"))
     [event] = await _events(session)
     assert event.payload["action_id"] is None
+
+
+async def test_the_users_telegram_name_is_kept_current(
+    database: Database, session: AsyncSession
+) -> None:
+    # It signs outbound emails by default.
+    await _ingest(database, message_update(1, sender_id=OWNER, message_id=1))
+    user = (await session.scalars(select(User))).one()
+    assert user.display_name == "Test User"
+
+    renamed = message_update(2, sender_id=OWNER, message_id=2)
+    renamed["message"]["from"] = {"id": OWNER, "is_bot": False, "first_name": "Roy"}
+    await _ingest(database, renamed)
+    await session.refresh(user)
+    assert user.display_name == "Roy"

@@ -21,8 +21,13 @@ from app.db.base import LOG_ID, Base, StrEnumType, TimestampMixin, UTCDateTime, 
 class ActionKind(StrEnum):
     """What pressing the button does. Members are added as milestones need them."""
 
-    # M3 test button on the echo reply. Removed when M5 replaces the echo.
-    ECHO_TEST = "echo_test"
+    # The /cancel confirmation: cancel the case, or leave it alone.
+    CANCEL_CASE = "cancel_case"
+    KEEP_CASE = "keep_case"
+    # Under an email draft (M6). The payload names the email and its content hash.
+    SEND_EMAIL = "send_email"
+    EDIT_DRAFT = "edit_draft"
+    CANCEL_DRAFT = "cancel_draft"
 
 
 class ActionStatus(StrEnum):

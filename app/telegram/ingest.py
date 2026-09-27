@@ -74,7 +74,7 @@ async def ingest_update(
     authorized = _authorized_sender(update.update_id, sender, chat, allowed_user_id)
     if authorized is None:
         return None
-    user = await get_or_create_user(session, authorized.id)
+    user = await get_or_create_user(session, authorized.id, display_name=authorized.full_name)
     new_event = NewEvent(
         user_id=user.id,
         type=event_type,

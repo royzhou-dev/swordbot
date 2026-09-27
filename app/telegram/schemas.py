@@ -15,6 +15,14 @@ class TelegramUser(_TelegramModel):
     id: int
     is_bot: bool = False
     username: str | None = None
+    first_name: str | None = None
+    last_name: str | None = None
+
+    @property
+    def full_name(self) -> str | None:
+        """The name as Telegram shows it: first and last name."""
+        parts = [p.strip() for p in (self.first_name, self.last_name) if p and p.strip()]
+        return " ".join(parts) or None
 
 
 class TelegramChat(_TelegramModel):

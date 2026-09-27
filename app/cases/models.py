@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Date,
     Float,
     ForeignKey,
@@ -61,6 +62,12 @@ class TransitionActor(StrEnum):
     USER = "user"
     AGENT = "agent"
     SYSTEM = "system"
+
+
+class MessageRole(StrEnum):
+    USER = "user"
+    # The bot.
+    ASSISTANT = "assistant"
 
 
 class SupportCase(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -146,3 +153,26 @@ class CaseTransition(Base):
     # The event that caused the transition, if any.
     event_id: Mapped[int | None] = mapped_column(LOG_ID, ForeignKey("events.id"))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+
+class CaseMessage(Base):
+    """The chat about a case, kept as context for the LLM.
+
+    Not workflow state: nothing decides anything from these rows. The text is
+    never logged.
+    """
+
+    __tablename__ = "case_messages"
+
+    id: Mapped[int] = mapped_column(LOG_ID, primary_key=True, autoincrement=True)
+    case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("support_cases.id"))
+    user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    role: Mapped[MessageRole] = mapped_column(StrEnumType(MessageRole, length=16))
+    text: Mapped[str] = mapped_column(Text)
+    # The user's Telegram message; None for the bot's messages.
+    telegram_message_id: Mapped[int | None] = mapped_column(BigInteger)
+    # The event whose handler wrote the row.
+    event_id: Mapped[int | None] = mapped_column(LOG_ID, ForeignKey("events.id"))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime, default=utcnow)
+
+    __table_args__ = (Index("ix_case_messages_case_id_id", "case_id", "id"),)

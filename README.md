@@ -2,7 +2,7 @@
 
 A personal customer-support assistant. You describe an order problem to a Telegram bot ("My DoorDash order was missing the fries"). The bot works out the details, drafts an email to the merchant's support team, and sends it from your Gmail only after you press **Send**. When support replies, the bot picks the case back up. It asks you before making any consequential decision, such as accepting store credit instead of a refund.
 
-> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, and the Telegram adapter and the LLM client layer exist. For now the bot only echoes messages back with a test button; the intake conversation and email come next. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
+> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer and the intake conversation exist. Tell the bot about an order problem and it asks for what's missing until the case is ready to draft. Drafting and sending the email come next. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
 ## Architecture
 
@@ -81,6 +81,7 @@ With SQLite the worker handles one event at a time, and a long handler holds SQL
 |---|---|
 | `ENVIRONMENT` | `development`, `test`, or `production`. Production turns on JSON logs and turns off `/docs`. |
 | `LOG_LEVEL` | Standard log level name |
+| `USER_TIMEZONE` | Your IANA timezone, such as `America/Los_Angeles` (default `UTC`). Turns "tonight" or "yesterday" into the right order date |
 | `APP_BASE_URL` | Public HTTPS URL of the deployment, used to register webhooks |
 | `DATABASE_URL` | SQLAlchemy async URL: `postgresql+asyncpg://…`, or `sqlite+aiosqlite:///…` for local development |
 | `TEST_DATABASE_URL` | Tests only. A disposable Postgres database; when set, DB tests also run against Postgres |
@@ -105,7 +106,7 @@ Secrets are loaded as `SecretStr` and are never logged. Log output also passes t
 
 All model calls go through `LLMClient` ([app/llm/](app/llm/), PLAN D4 and D11), on the OpenAI Responses API. Only `app/llm/openai_client.py` imports the `openai` SDK.
 
-- **Two calls.** `complete` returns free text. `extract_structured` returns a Pydantic model: the request carries a strict JSON schema, the reply is validated in code, and invalid output gets **one** repair retry. If it is still invalid, the event fails with `InvalidAgentDecisionError` and you get a Telegram notice. Agent steps (M5) are structured outputs too.
+- **Two calls.** `complete` returns free text. `extract_structured` returns a Pydantic model: the request carries a strict JSON schema, the reply is validated in code, and invalid output gets **one** repair retry. If it is still invalid, the event fails with `InvalidAgentDecisionError` and you get a Telegram notice. Agent steps are structured outputs too (see Intake conversation).
 - **Stateless, not stored.** Every request sends the full context and sets `store=false`, so OpenAI keeps no stored response to chain from; the database owns conversation state. Only the minimum content needed for the task is sent.
 - **Errors.** Timeouts, connection errors, 5xx and rate limits are temporary and retried by the worker. A bad key (401/403), an exhausted quota (`insufficient_quota`), a rejected request (such as an unknown model) or a refusal is permanent. Error messages carry only the status and OpenAI's error code.
 - **Logs.** Each call logs an `llm_call` line with purpose, model, schema, attempts, duration and token usage, never prompts or output.
@@ -115,9 +116,49 @@ To check your key and model against the real API (one or two small calls):
 ```bash
 uv run python scripts/llm_smoke.py
 uv run python scripts/llm_smoke.py --text "Amazon sent me the wrong charger"
+uv run python scripts/llm_smoke.py --intake   # the real intake prompt and IntakeDecision schema
+uv run python scripts/llm_smoke.py --draft    # a draft for a sample case (DraftSupportEmail)
 ```
 
-It prints the extracted `ExtractedIssue` as JSON, or a typed error such as `LLMAuthenticationError: 401: invalid_api_key`.
+It prints the extracted `ExtractedIssue` (or, with `--intake`, the `IntakeDecision`; with `--draft`, the drafted subject and body) as JSON, or a typed error such as `LLMAuthenticationError: 401: invalid_api_key`.
+
+## Intake conversation
+
+Tell the bot what went wrong in plain words. It opens a **case**, records each detail you give as a **fact** tagged with its source (your Telegram message), and asks one short question per turn until it has what it needs. Then the case is **ready to draft**, and the bot drafts the email straight away (see below).
+
+What "what it needs" means is decided in code ([app/agent/policies.py](app/agent/policies.py)), not by the model. Every case needs the kind of problem, a short description, the merchant, what you want done (refund, replacement, ...) and the merchant's **support email address**, which you type in until address lookup arrives (M9). Order problems also need the order (an order number **or** the date you ordered), and for missing, wrong or damaged items, which items.
+
+- **One model call per message.** The model returns the facts it found in your message and a proposed next step. Code records the facts, recomputes what's missing and decides: the model's question, a fallback question of its own, or "drafting now". Only code moves a case between "gathering context" and "ready to draft".
+- **No invented details.** Facts are only what you said. An order number, support address or name the model reports is dropped unless it appears in your message, a support address must look like one, and an order date must be a real date that isn't in the future.
+- **Corrections.** Send a correction any time ("actually it was order #A123"). The new value is recorded alongside the old one.
+- **Small talk** ("hi", "thanks") gets a short reply and opens no case.
+- **Commands.** `/help` (or `/start`) explains the bot. `/cancel` offers to cancel the case you're working on, with **[Yes, cancel] [Keep it]** buttons. Only the button cancels, and nothing is sent to support.
+
+Under the hood ([app/agent/](app/agent/), [app/tools/](app/tools/), PLAN D11 and D12): each step of the agent is one structured LLM call whose action is one of the tools it's allowed to use. The tool executor enforces each tool's risk level in code. `read_only` and `low_risk_write` tools (so far `ask_user` and `reply_to_user`, which message you, and `draft_support_email`, which saves a draft and shows it to you) can run. `requires_approval` tools need an approval record, and the agent can never supply one: approvals come only from your button presses. The loop is capped at 4 steps per message. The last 20 messages of the case are sent as context. Case facts and tool results go into delimited data blocks, and the prompt tells the model to treat them as data, never as instructions.
+
+## Drafting and approval
+
+Once intake has everything, the bot writes the email to the merchant's support and shows it to you:
+
+```text
+Here's the email I'd send. Nothing goes out until you tap Send.
+
+To: support@doordash.com
+Subject: Missing fries from order #A123
+...
+Thank you,
+Your Name
+
+[Send] [Edit] [Cancel]
+```
+
+- **The model writes the subject and body; code does the rest.** The recipient is the support address you gave, and the sign-off is added by code: by default your Telegram name (first and last, kept up to date from your messages). If an order is under another name, say so ("the order is under Alex Kim, sign it with that") and that name signs this case's emails only. Drafts with placeholders like `[Your Name]` are rejected and the model gets one chance to fix them.
+- **Send** approves exactly the email on screen. The approval is bound to a hash of the recipient, subject and body, so it can't carry over to anything else. Pressing Send twice approves once. **Sending itself arrives in M7**: for now the case stops at "approved, ready to send".
+- **Edit**, or simply typing a change ("make it shorter", "ask for a replacement instead"), makes the bot write a new version with new buttons. The old version's buttons stop working. A detail you change here (a new support address, order number or name) is recorded as a fact too. If the change needs more information (say, the fries were crushed, not missing), the case goes back to intake for it.
+- **Typing approval does nothing.** "Looks good, send it" gets a reply telling you to tap Send. The draft-review step can only write a new version or reply; approving isn't among its options, and only the Send button reaches the approval code.
+- **Cancel** asks for confirmation (**[Yes, cancel] [Keep it]**). Cancelling the case also cancels its draft. "Keep it" brings the draft back with working buttons.
+
+Every version is kept in `outbound_emails` with its status (`awaiting_approval`, `approved`, `superseded`, `cancelled`; `sending`, `sent`, `failed` and `needs_attention` arrive with M7), who approved it and when (PLAN D2 and D13).
 
 ## Gmail OAuth setup
 
@@ -142,7 +183,7 @@ uv run uvicorn app.main:app --reload     # terminal 1: API + worker
 uv run python scripts/telegram_poll.py   # terminal 2: Telegram -> events
 ```
 
-The poller deletes any registered webhook first (Telegram refuses polling while one is set) and passes each update through the same code as the webhook. Send the bot a message: it echoes it back with a **Test button**. Pressing the button once confirms it; pressing it again says it is no longer valid.
+The poller deletes any registered webhook first (Telegram refuses polling while one is set) and passes each update through the same code as the webhook. Send the bot a complaint, such as "My DoorDash order tonight was missing the fries", and answer its questions. Try `/cancel` to see the confirmation buttons: a button works once, and pressing another button on the same message afterwards says it is no longer valid.
 
 **Production uses the webhook** `POST /telegram/webhook` (set up in M7.5). It is disabled (404) unless `TELEGRAM_WEBHOOK_SECRET` is set, and rejects requests whose `X-Telegram-Bot-Api-Secret-Token` header doesn't match (401).
 

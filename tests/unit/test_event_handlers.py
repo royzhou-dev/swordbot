@@ -1,6 +1,7 @@
 import uuid
 from datetime import UTC, datetime
 from typing import cast
+from zoneinfo import ZoneInfo
 
 import pytest
 from pydantic import BaseModel
@@ -12,7 +13,7 @@ from app.events.models import EventSource, EventType
 from app.events.routing import build_registry
 from app.events.schemas import ClaimedEvent
 from app.logging import get_logger
-from tests.fakes import FakeTelegramClient
+from tests.fakes import FakeLLMClient, FakeTelegramClient
 
 
 class Greeting(BaseModel):
@@ -81,10 +82,11 @@ def test_registering_a_type_twice_is_an_error() -> None:
 
 
 def test_default_registry_handles_chat_events() -> None:
-    registry = build_registry(FakeTelegramClient())
+    registry = build_registry(FakeTelegramClient(), FakeLLMClient(), user_timezone=ZoneInfo("UTC"))
     for event_type in (
         EventType.USER_MESSAGE,
         EventType.USER_BUTTON_ACTION,
+        EventType.DRAFT_EMAIL,
         EventType.TELEGRAM_OUTBOUND,
     ):
         assert registry.handles(event_type)

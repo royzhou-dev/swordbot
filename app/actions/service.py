@@ -112,6 +112,21 @@ async def record_delivery(
     )
 
 
+async def group_message_id(session: AsyncSession, group_id: uuid.UUID) -> int | None:
+    """The Telegram message showing the group's buttons, or None if not delivered yet."""
+    return await session.scalar(
+        select(PendingAction.telegram_message_id)
+        .where(PendingAction.group_id == group_id, PendingAction.telegram_message_id.is_not(None))
+        .limit(1)
+    )
+
+
+async def has_open_actions(
+    session: AsyncSession, group_id: uuid.UUID, *, user_id: uuid.UUID, now: datetime
+) -> bool:
+    return bool(await open_actions_in_group(session, group_id, user_id=user_id, now=now))
+
+
 async def supersede_group(session: AsyncSession, group_id: uuid.UUID, *, now: datetime) -> None:
     """Close every open action in the group, e.g. because the prompt no longer applies."""
     await session.execute(

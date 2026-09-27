@@ -10,6 +10,7 @@ from app.db.session import Database
 from app.events.routing import build_registry
 from app.events.service import EventPolicy
 from app.events.worker import EventWorker
+from app.llm.factory import build_llm_client
 from app.logging import configure_logging, get_logger
 from app.telegram.client import HttpTelegramClient, TelegramClient, UnconfiguredTelegramClient
 from app.telegram.notifier import TelegramDeadEventNotifier
@@ -34,11 +35,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             telegram_client = HttpTelegramClient(
                 settings.telegram_bot_token, http, base_url=settings.telegram_api_base_url
             )
+        llm = build_llm_client(settings)
         worker: EventWorker | None = None
         if settings.worker_enabled:
             worker = EventWorker(
                 database,
-                build_registry(telegram_client),
+                build_registry(telegram_client, llm, user_timezone=settings.user_zoneinfo),
                 EventPolicy.from_settings(settings),
                 notifier=TelegramDeadEventNotifier(database),
                 concurrency=settings.worker_concurrency,
@@ -53,6 +55,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             if worker is not None:
                 await worker.stop()
+            await llm.aclose()
             await http.aclose()
             await database.dispose()
             get_logger(__name__).info("app_stopped")

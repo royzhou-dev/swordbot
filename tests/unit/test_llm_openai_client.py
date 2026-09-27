@@ -5,14 +5,16 @@ tests hand the client an `httpx2.MockTransport` instead.
 """
 
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from typing import Any
 
 import httpx2
 import pytest
+from openai.lib._pydantic import to_strict_json_schema
 from pydantic import BaseModel, SecretStr
 from structlog.testing import capture_logs
 
+from app.agent.schemas import DraftReviewDecision, IntakeDecision
 from app.config import Settings
 from app.events.errors import PermanentEventError
 from app.llm.client import Message, UnconfiguredLLMClient
@@ -28,6 +30,7 @@ from app.llm.errors import (
 from app.llm.factory import build_llm_client
 from app.llm.openai_client import OpenAIClient
 from app.llm.schemas import ExtractedIssue
+from app.tools.email_tools import DraftSupportEmail
 
 API_KEY = "sk-test-FakeKeyFakeKeyFakeKey"
 MODEL = "gpt-test"
@@ -315,6 +318,9 @@ async def test_unconfigured_client_fails_permanently() -> None:
 async def test_factory_picks_the_client_from_settings() -> None:
     unconfigured = build_llm_client(Settings(_env_file=None, openai_api_key=None))
     assert isinstance(unconfigured, UnconfiguredLLMClient)
+    # An empty `OPENAI_API_KEY=` line in .env.
+    blank = build_llm_client(Settings(_env_file=None, openai_api_key=" "))
+    assert isinstance(blank, UnconfiguredLLMClient)
 
     configured = build_llm_client(Settings(_env_file=None, openai_api_key=API_KEY))
     assert isinstance(configured, OpenAIClient)
@@ -331,3 +337,27 @@ async def test_schema_name_is_the_model_name(
     recorder = Recorder(_text('{"value": "x"}'))
     await make_client(recorder).extract_structured(PROMPT, _Anything, purpose="test")
     assert recorder.bodies[0]["text"]["format"]["name"] == "_Anything"
+
+
+def _objects(node: Any) -> Iterator[dict[str, Any]]:
+    """Every object schema inside a JSON schema."""
+    if isinstance(node, dict):
+        if node.get("type") == "object":
+            yield node
+        for value in node.values():
+            yield from _objects(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _objects(item)
+
+
+@pytest.mark.parametrize("schema", [IntakeDecision, DraftReviewDecision, DraftSupportEmail])
+def test_agent_schemas_fit_strict_mode(schema: type[BaseModel]) -> None:
+    # PLAN D11: strict mode rejects oneOf, and every field must be required.
+    converted = to_strict_json_schema(schema)
+    text = json.dumps(converted)
+    assert '"oneOf"' not in text
+    assert '"default"' not in text
+    for obj in _objects(converted):
+        assert obj["additionalProperties"] is False
+        assert set(obj["required"]) == set(obj["properties"])
