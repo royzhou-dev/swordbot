@@ -17,7 +17,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 | M1 | DB + `SupportCase` + explicit state machine + Alembic | done |
 | M2 | Event inbox/job queue + worker + idempotency | done |
 | M3 | Telegram adapter (webhook + local polling, auth, buttons via `pending_actions`) | done |
-| M4 | `LLMClient` abstraction (OpenAI + fake) | not started |
+| M4 | `LLMClient` abstraction (OpenAI + fake) | done |
 | M5 | Tool registry with risk levels + agent runtime + intake conversation | not started |
 | M6 | Email drafting + Send/Edit/Cancel approval | not started |
 | M7 | Gmail send + thread id stored → `WAITING_FOR_SUPPORT` (**Phase 1 done**) | not started |
@@ -46,7 +46,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 - **Tool authorization** is enforced in the tool executor based on `ToolRiskLevel`, not in prompts. `REQUIRES_APPROVAL` tools require an approval record id.
 - **Buttons (D3):** `callback_data` = short `pending_actions.id` only. Validate that the action is open, belongs to this user, and matches the case state, then consume it (`actions.service.consume`).
 - **Telegram replies (D10):** handlers never call Telegram. They queue calls through `TelegramOutbox` (`app/telegram/delivery.py`), which become `telegram_outbound` events delivered by the worker.
-- **LLM:** all calls go through `LLMClient` (`app/llm/client.py`). Outputs that drive the workflow use Pydantic structured output and are validated. Model names come from env. No direct `openai` imports outside `app/llm/`.
+- **LLM:** all calls go through `LLMClient` (`app/llm/client.py`): `complete` for text, `extract_structured` for anything that drives the workflow (validated Pydantic output, one repair retry, then a permanent `InvalidAgentDecisionError`). Agent steps are structured `AgentDecision`s, not native function calling (PLAN D11). Requests are stateless with `store=False`. Model names come from env. Only `app/llm/openai_client.py` imports `openai`. Tests use `FakeLLMClient` (`tests/fakes.py`).
 - **Gmail:** send only the minimum email content to the LLM. Parse and trim receipts in code first. Match inbound mail by thread id first, then fall back to headers.
 - Every table row belongs to a `user_id`, even though v1 is single-user.
 - Keep it a modular monolith. No giant agent class, hidden globals, or premature infrastructure.
@@ -74,6 +74,7 @@ TEST_DATABASE_URL=postgresql+asyncpg://swordbot:swordbot@localhost:5432/swordbot
 uv run ruff check . && uv run ruff format --check . && uv run mypy app
 uv run python scripts/inject_event.py --type user_message --payload '{"text": "hi"}'   # push a synthetic event (dev)
 uv run python scripts/telegram_poll.py   # local Telegram polling (run next to uvicorn; instead of webhook)
+uv run python scripts/llm_smoke.py       # one real ExtractedIssue call to check OPENAI_API_KEY / OPENAI_MODEL
 uv run python scripts/gmail_auth.py      # one-time Gmail OAuth → refresh token
 ```
 

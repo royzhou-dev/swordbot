@@ -37,6 +37,28 @@ def test_redacts_nested_values() -> None:
     assert out["request"] == {"headers": {"authorization": REDACTED}, "path": "/p"}
 
 
+def test_redacts_llm_prompts_and_output() -> None:
+    out = redact_sensitive(
+        None,
+        "info",
+        {
+            "event": "x",
+            "prompt": "p",
+            "system_prompt": "p",
+            "completion": "c",
+            "messages": [{"role": "user", "content": "c"}],
+            "content": "c",
+            "instructions": "i",
+            "purpose": "intake_extract",
+            "usage": {"input": 30, "output": 12},
+        },
+    )
+    for key in ("prompt", "system_prompt", "completion", "messages", "content", "instructions"):
+        assert out[key] == REDACTED, key
+    assert out["purpose"] == "intake_extract"
+    assert out["usage"] == {"input": 30, "output": 12}
+
+
 def test_secret_str_config_values_do_not_leak_in_repr() -> None:
     from app.config import Settings
 

@@ -85,6 +85,14 @@ These were decided up front so that every milestone builds on the same foundatio
 - When an event goes `dead`, `TelegramDeadEventNotifier` queues a short notice to the user. A failed notice is never itself reported, so failures can't cascade.
 - The bot talks only in private chats, where the chat id equals the user's Telegram id, so replies go to `users.telegram_user_id`.
 
+### D11. Agent steps are structured decisions (decided in M4)
+- `LLMClient` has two calls: `complete` (free text) and `extract_structured` (a validated Pydantic model). There is **no `run_agent`** and no native function calling.
+- Each agent step (M5) is one `extract_structured` call returning an `AgentDecision` whose `action` is a tagged union of the permitted tool calls. Code validates the decision, enforces the tool's `ToolRiskLevel`, runs the tool, and feeds the result back as a delimited data block. The bounded loop lives in `agent/runtime.py`.
+- Why: one schema per step, no provider-specific tool-call message plumbing, trivially faked in tests, and every action the model proposes is a typed object that code checks before anything happens.
+- Output that still fails validation after the one repair retry raises `InvalidAgentDecisionError`, a `PermanentEventError`: the event goes `dead` and the user is notified. This caps an attempt at 2 calls, where worker retries could have made up to 16.
+- Requests use the OpenAI Responses API with `store=False` and send the full context every time. The database owns conversation state (`previous_response_id` is never used).
+- The SDK retries brief failures itself (`OPENAI_MAX_RETRIES`, default 1, with `OPENAI_TIMEOUT_SECONDS`, default 45). The worst case for one structured call (45s x 2 tries x 2 for the repair) stays under the handler cutoff.
+
 ---
 
 ## Case state machine
@@ -159,13 +167,15 @@ Additional rules:
 - **Verify:** a real bot echoes a message and handles a button press end to end in polling mode. Tests cover the auth rejection, duplicate updates, and stale-button handling.
 
 ### M4. LLM layer
-- `llm/client.py`: the `LLMClient` protocol (`complete`, `extract_structured`, `run_agent`), an `OpenAIClient` implementation, and a `FakeLLMClient` for tests. Typed errors: `LLMTemporaryError`, `InvalidAgentDecisionError`.
+- `llm/client.py`: the `LLMClient` protocol (`complete`, `extract_structured`; `run_agent` was dropped, see D11), an `OpenAIClient` implementation, and a `FakeLLMClient` for tests. Typed errors: `LLMTemporaryError`, `InvalidAgentDecisionError`.
 - Every structured output is validated against its Pydantic schema. One repair retry is allowed, then it raises a typed error.
+- Built as: `llm/client.py` (`Message`, the protocol, `UnconfiguredLLMClient`), `llm/structured.py` (provider-independent validation and repair; the repair prompt names error locations, not values), `llm/openai_client.py` (Responses API, strict JSON schema from the SDK's `to_strict_json_schema`, error mapping, `llm_call` log), `llm/errors.py`, `llm/schemas.py` (`ExtractedIssue`), `llm/factory.py` (`build_llm_client`). Permanent errors: `LLMAuthenticationError` (401/403, missing key), `LLMQuotaError` (429 `insufficient_quota`), `LLMRequestError` (other 4xx), `LLMRefusalError`, `InvalidAgentDecisionError`. The SDK sends requests with `httpx2`, so its tests use an `httpx2.MockTransport` instead of respx. Wiring the client into the app lifespan waits for M5, its first user.
 - **Verify:** unit tests with the fake client. `scripts/llm_smoke.py` runs `ExtractedIssue` extraction against the real API.
 
 ### M5. Agent runtime and intake conversation
 - `tools/registry.py`: a `Tool` definition (name, Pydantic args and result, `ToolRiskLevel`). The executor enforces the risk level: `REQUIRES_APPROVAL` tools need an approval record id.
-- `agent/runtime.py`: a bounded loop (at most N tool steps per event) that returns an `AgentDecision`. `agent/policies.py` holds the required fields for each issue type (for example, missing item needs merchant, order identifier, missing items and desired resolution). `agent/prompts.py` includes the untrusted-content policy.
+- `agent/runtime.py`: a bounded loop (at most N tool steps per event). Each step is one `extract_structured` call returning an `AgentDecision` (D11). `agent/policies.py` holds the required fields for each issue type (for example, missing item needs merchant, order identifier, missing items and desired resolution). `agent/prompts.py` includes the untrusted-content policy and the helper that renders untrusted content as delimited data blocks.
+- Build the `LLMClient` in the app lifespan (`build_llm_client`) and pass it to the handlers.
 - Handler flow for `USER_MESSAGE`: route to a case (D7), extract or merge facts (provenance = `user_message`), compute missing fields in code, and ask one short question per turn.
 - **Verify:** an integration test with the fake LLM covers the complaint, one follow-up question, the answer, and the case reaching `READY_TO_DRAFT` with facts sourced correctly.
 

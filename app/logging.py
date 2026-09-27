@@ -2,8 +2,8 @@
 
 Logs are JSON in production and human-readable in development. A redaction
 processor masks values whose key looks sensitive (tokens, secrets, email bodies,
-auth headers) so they never reach log output, even if a caller passes them by
-mistake. It also blanks anything shaped like a Telegram bot token inside any
+LLM prompts, auth headers) so they never reach log output, even if a caller
+passes them by mistake. It also blanks anything shaped like a Telegram bot token inside any
 string value, because the token is part of every Bot API URL.
 """
 
@@ -18,7 +18,8 @@ REDACTED = "[REDACTED]"
 
 _SENSITIVE_KEY = re.compile(
     r"token|secret|password|passwd|api_key|apikey|authorization|cookie|credential"
-    r"|^body$|_body$|^body_|^text$|^html$|card_number|cvv",
+    r"|^body$|_body$|^body_|^text$|^html$|card_number|cvv"
+    r"|prompt|completion|^messages$|^content$|^instructions$",
     re.IGNORECASE,
 )
 
@@ -26,7 +27,8 @@ _SENSITIVE_KEY = re.compile(
 _BOT_TOKEN = re.compile(r"(?<!\d)\d{5,}:[A-Za-z0-9_-]{30,}")
 
 # These log full request URLs at INFO, and Telegram URLs contain the bot token.
-_NOISY_URL_LOGGERS = ("httpx", "httpcore")
+# The OpenAI SDK uses httpx2.
+_NOISY_URL_LOGGERS = ("httpx", "httpcore", "httpx2", "httpcore2")
 
 
 def _redact(value: Any) -> Any:

@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # integration exists; the milestone that uses a credential validates it.
     openai_api_key: SecretStr | None = None
     openai_model: str = "gpt-5"
+    # Per request. The SDK retries brief failures itself; the worker's backoff
+    # covers longer outages. Keep timeout x (retries + 1) x 2 (repair) well under
+    # the handler cutoff (90% of EVENT_LEASE_SECONDS).
+    openai_timeout_seconds: float = Field(default=45, gt=0)
+    openai_max_retries: int = Field(default=1, ge=0)
 
     telegram_bot_token: SecretStr | None = None
     telegram_webhook_secret: SecretStr | None = None

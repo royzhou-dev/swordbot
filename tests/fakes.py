@@ -4,6 +4,10 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
+from pydantic import BaseModel, ValidationError
+
+from app.llm.client import Message
+from app.llm.errors import InvalidAgentDecisionError
 from app.telegram.client import ReplyMarkup
 from app.telegram.schemas import SentMessage, TelegramChat, TelegramUser
 
@@ -80,6 +84,74 @@ class FakeTelegramClient:
 
     async def delete_webhook(self, *, drop_pending_updates: bool = False) -> None:
         self._record("delete_webhook", drop_pending_updates=drop_pending_updates)
+
+
+@dataclass(frozen=True)
+class LLMCall:
+    method: str
+    messages: list[Message]
+    schema: type[BaseModel] | None
+    purpose: str
+
+
+# A scripted reply: a model instance or a dict (validated against the requested
+# schema) for `extract_structured`, a str for `complete`, or an exception to raise.
+type LLMReply = BaseModel | dict[str, Any] | str | Exception
+
+
+class FakeLLMClient:
+    """Answers from a script, in call order. An unscripted call fails the test.
+
+    A dict reply that doesn't validate raises `InvalidAgentDecisionError`, as the
+    real client does once its repair retry has failed.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[LLMCall] = []
+        self.closed = False
+        self._replies: list[LLMReply] = []
+
+    def script(self, *replies: LLMReply) -> None:
+        self._replies.extend(replies)
+
+    @property
+    def unused_replies(self) -> int:
+        return len(self._replies)
+
+    async def complete(self, messages: list[Message], *, purpose: str) -> str:
+        reply = self._next(LLMCall("complete", list(messages), None, purpose))
+        if not isinstance(reply, str):
+            raise AssertionError(f"complete({purpose}) was scripted a {type(reply).__name__}")
+        return reply
+
+    async def extract_structured[T: BaseModel](
+        self, messages: list[Message], schema: type[T], *, purpose: str
+    ) -> T:
+        reply = self._next(LLMCall("extract_structured", list(messages), schema, purpose))
+        if isinstance(reply, dict):
+            try:
+                return schema.model_validate(reply)
+            except ValidationError as exc:
+                locations = [".".join(str(p) for p in e["loc"]) for e in exc.errors()]
+                raise InvalidAgentDecisionError(schema.__name__, locations) from None
+        if not isinstance(reply, schema):
+            raise AssertionError(
+                f"extract_structured({purpose}) wants {schema.__name__}, "
+                f"was scripted a {type(reply).__name__}"
+            )
+        return reply
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+    def _next(self, call: LLMCall) -> BaseModel | dict[str, Any] | str:
+        self.calls.append(call)
+        if not self._replies:
+            raise AssertionError(f"unscripted LLM call: {call.method}({call.purpose})")
+        reply = self._replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
 
 # --- Raw Telegram updates ---------------------------------------------------------

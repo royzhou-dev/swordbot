@@ -2,7 +2,7 @@
 
 A personal customer-support assistant. You describe an order problem to a Telegram bot ("My DoorDash order was missing the fries"). The bot works out the details, drafts an email to the merchant's support team, and sends it from your Gmail only after you press **Send**. When support replies, the bot picks the case back up. It asks you before making any consequential decision, such as accepting store credit instead of a refund.
 
-> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, and the Telegram adapter exist. For now the bot only echoes messages back with a test button; the LLM and email come next. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
+> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, and the Telegram adapter and the LLM client layer exist. For now the bot only echoes messages back with a test button; the intake conversation and email come next. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
 ## Architecture
 
@@ -90,7 +90,8 @@ With SQLite the worker handles one event at a time, and a long handler holds SQL
 | `EVENT_MAX_ATTEMPTS` | Attempts before an event is marked `dead` (default `8`) |
 | `EVENT_RETRY_BASE_SECONDS`, `EVENT_RETRY_MAX_SECONDS` | Exponential backoff start and cap (defaults `15` and `1800`) |
 | `EVENT_LEASE_SECONDS` | How long a claimed event may run before it is presumed crashed (default `300`) |
-| `OPENAI_API_KEY`, `OPENAI_MODEL` | LLM access and model name |
+| `OPENAI_API_KEY`, `OPENAI_MODEL` | LLM access and model name (default `gpt-5`) |
+| `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_RETRIES` | Per-request timeout and the SDK's own quick retries (defaults `45` and `1`) |
 | `TELEGRAM_BOT_TOKEN` | Token from @BotFather |
 | `TELEGRAM_WEBHOOK_SECRET` | Secret that Telegram echoes back in `X-Telegram-Bot-Api-Secret-Token` |
 | `TELEGRAM_ALLOWED_USER_ID` | The only Telegram user the bot responds to (your numeric id) |
@@ -99,6 +100,24 @@ With SQLite the worker handles one event at a time, and a long handler holds SQL
 | `GMAIL_REFRESH_TOKEN` | Produced by the one-time OAuth script (M7) |
 
 Secrets are loaded as `SecretStr` and are never logged. Log output also passes through a redaction step (`app/logging.py`).
+
+## LLM
+
+All model calls go through `LLMClient` ([app/llm/](app/llm/), PLAN D4 and D11), on the OpenAI Responses API. Only `app/llm/openai_client.py` imports the `openai` SDK.
+
+- **Two calls.** `complete` returns free text. `extract_structured` returns a Pydantic model: the request carries a strict JSON schema, the reply is validated in code, and invalid output gets **one** repair retry. If it is still invalid, the event fails with `InvalidAgentDecisionError` and you get a Telegram notice. Agent steps (M5) are structured outputs too.
+- **Stateless, not stored.** Every request sends the full context and sets `store=false`, so OpenAI keeps no stored response to chain from; the database owns conversation state. Only the minimum content needed for the task is sent.
+- **Errors.** Timeouts, connection errors, 5xx and rate limits are temporary and retried by the worker. A bad key (401/403), an exhausted quota (`insufficient_quota`), a rejected request (such as an unknown model) or a refusal is permanent. Error messages carry only the status and OpenAI's error code.
+- **Logs.** Each call logs an `llm_call` line with purpose, model, schema, attempts, duration and token usage, never prompts or output.
+
+To check your key and model against the real API (one or two small calls):
+
+```bash
+uv run python scripts/llm_smoke.py
+uv run python scripts/llm_smoke.py --text "Amazon sent me the wrong charger"
+```
+
+It prints the extracted `ExtractedIssue` as JSON, or a typed error such as `LLMAuthenticationError: 401: invalid_api_key`.
 
 ## Gmail OAuth setup
 
