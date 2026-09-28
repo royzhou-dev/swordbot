@@ -26,7 +26,10 @@ class LLMAuthenticationError(LLMPermanentError):
 
 
 class LLMQuotaError(LLMPermanentError):
-    """The account is out of credit (429 `insufficient_quota`). Needs billing, not a retry."""
+    """The account is out of credit (429 `insufficient_quota` or `credit_balance_exhausted`).
+
+    Needs billing, not a retry.
+    """
 
 
 class LLMRequestError(LLMPermanentError):

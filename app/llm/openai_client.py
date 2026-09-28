@@ -36,7 +36,8 @@ from app.logging import get_logger
 
 log = get_logger(__name__)
 
-_QUOTA_CODE = "insufficient_quota"
+# 429 codes meaning the account is out of credit, as opposed to rate-limited.
+_QUOTA_CODES = frozenset({"insufficient_quota", "credit_balance_exhausted"})
 
 
 class OpenAIClient:
@@ -147,7 +148,7 @@ def _raise_mapped(exc: openai.APIError) -> NoReturn:
     if isinstance(exc, openai.APIStatusError):
         status, code = exc.status_code, exc.code
         if status == 429:
-            if code == _QUOTA_CODE:
+            if code in _QUOTA_CODES:
                 raise LLMQuotaError(f"429: {code}") from None
             raise LLMTemporaryError(f"429: {code or 'rate limited'}") from None
         if status >= 500:

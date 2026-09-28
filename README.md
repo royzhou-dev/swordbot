@@ -2,7 +2,7 @@
 
 A personal customer-support assistant. You describe an order problem to a Telegram bot ("My DoorDash order was missing the fries"). The bot works out the details, drafts an email to the merchant's support team, and sends it from your Gmail only after you press **Send**. When support replies, the bot picks the case back up. It asks you before making any consequential decision, such as accepting store credit instead of a refund.
 
-> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer, the intake conversation, and drafting with **[Send] [Edit] [Cancel]** approval exist. Tell the bot about an order problem, answer its questions, and it shows you the email it would send. Press Send and it goes out from your Gmail (see [Gmail setup](#gmail-setup)); replies aren't read yet, so they arrive only in your inbox. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
+> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer, the intake conversation, and drafting with **[Send] [Edit] [Cancel]** approval exist. Tell the bot about an order problem, answer its questions, and it shows you the email it would send. Press Send and it goes out from your Gmail (see [Gmail setup](#gmail-setup)). Phase 1 is complete. Replies aren't read yet, so they arrive only in your inbox. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
 ## Architecture
 
@@ -110,7 +110,7 @@ All model calls go through `LLMClient` ([app/llm/](app/llm/), PLAN D4 and D11), 
 
 - **Two calls.** `complete` returns free text. `extract_structured` returns a Pydantic model: the request carries a strict JSON schema, the reply is validated in code, and invalid output gets **one** repair retry. If it is still invalid, the event fails with `InvalidAgentDecisionError` and you get a Telegram notice. Agent steps are structured outputs too (see Intake conversation).
 - **Stateless, not stored.** Every request sends the full context and sets `store=false`, so OpenAI keeps no stored response to chain from; the database owns conversation state. Only the minimum content needed for the task is sent.
-- **Errors.** Timeouts, connection errors, 5xx and rate limits are temporary and retried by the worker. A bad key (401/403), an exhausted quota (`insufficient_quota`), a rejected request (such as an unknown model) or a refusal is permanent. Error messages carry only the status and OpenAI's error code.
+- **Errors.** Timeouts, connection errors, 5xx and rate limits are temporary and retried by the worker. A bad key (401/403), no credit left (`insufficient_quota` or `credit_balance_exhausted`), a rejected request (such as an unknown model) or a refusal is permanent. Error messages carry only the status and OpenAI's error code.
 - **Logs.** Each call logs an `llm_call` line with purpose, model, schema, attempts, duration and token usage, never prompts or output.
 
 To check your key and model against the real API (one or two small calls):

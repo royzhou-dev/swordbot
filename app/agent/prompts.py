@@ -65,9 +65,14 @@ How to write the email:
 - Write as the user, in the first person, to the merchant's customer support.
 - subject: short and specific; include the order number if it is known.
 - body: start with a greeting such as "Hi,". Then say which order it is (order number \
-and/or date), what went wrong and which items were affected, and ask clearly for the \
-resolution the user wants. End with that request. Do not add a closing such as "Thank \
-you," or any name: the app adds the sign-off.
+and/or date), what went wrong and which items were affected, and ask for the resolution \
+the user wants. End with that request. Do not add a closing such as "Thank you," or any \
+name: the app adds the sign-off.
+- Tone: a customer asking a favor of the person reading, not issuing an order. Phrase the \
+request as a polite question or wish ("Would it be possible to get a refund for the \
+fries?", "I'd appreciate it if you could send a replacement."), never as a command \
+("Please issue a refund.", "Refund the item."). Be specific about what the user wants, \
+but let support decide how to handle it. Friendly, not grovelling or over-apologetic.
 - Use only the facts provided. Never invent order details, amounts, dates, items, \
 policies, deadlines or earlier contact. Leave out anything unknown; never write a \
 placeholder such as [Order Number].
