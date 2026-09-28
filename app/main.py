@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from app.api import health, telegram
 from app.config import Settings, get_settings
 from app.db.session import Database
+from app.email.gmail_client import GmailClient, UnconfiguredGmailClient
 from app.events.routing import build_registry
 from app.events.service import EventPolicy
 from app.events.worker import EventWorker
@@ -36,11 +37,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 settings.telegram_bot_token, http, base_url=settings.telegram_api_base_url
             )
         llm = build_llm_client(settings)
+        # M7 part 2 replaces this with the real Gmail client. Until then every
+        # send fails as "Gmail isn't connected" and nothing is sent.
+        gmail: GmailClient = UnconfiguredGmailClient()
         worker: EventWorker | None = None
         if settings.worker_enabled:
             worker = EventWorker(
                 database,
-                build_registry(telegram_client, llm, user_timezone=settings.user_zoneinfo),
+                build_registry(
+                    telegram_client,
+                    llm,
+                    gmail=gmail,
+                    database=database,
+                    user_timezone=settings.user_zoneinfo,
+                    sender_address=settings.gmail_sender_address,
+                ),
                 EventPolicy.from_settings(settings),
                 notifier=TelegramDeadEventNotifier(database),
                 concurrency=settings.worker_concurrency,
@@ -56,6 +67,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if worker is not None:
                 await worker.stop()
             await llm.aclose()
+            await gmail.aclose()
             await http.aclose()
             await database.dispose()
             get_logger(__name__).info("app_stopped")

@@ -44,11 +44,16 @@ DRAFT_FOOTER = "Tap Send to approve it, Edit to change something, or Cancel to d
 
 # "[Your Name]", "{{order}}", "<ORDER NUMBER>": the model filling a gap it should leave out.
 _PLACEHOLDER = re.compile(r"\[[^\]\n]{1,40}\]|\{\{|\}\}|<[A-Z][A-Z _]{2,30}>")
-# A closing line; code adds the sign-off.
+# A closing line such as "Best regards," or "Thanks again!"; code adds the sign-off.
 _SIGN_OFF = re.compile(
-    r"^(best|kind|warm)?\s*(regards|thanks|thank you|many thanks|sincerely|cheers|best)[,.!]?$",
+    r"^(?:(?:best|kind|warm|warmest|many|with)\s+){0,2}"
+    r"(?:regards|thanks|thank\s+you|sincerely|cheers|respectfully|best(?:\s+wishes)?"
+    r"|yours(?:\s+(?:truly|sincerely|faithfully))?|all\s+the\s+best)"
+    r"(?:\s+(?:so\s+much|very\s+much|in\s+advance|again))?[\s,.!]*$",
     re.IGNORECASE,
 )
+# A closing is often followed by a name, and maybe a title or phone number.
+_SIGN_OFF_WINDOW = 3
 
 
 class DraftSupportEmail(BaseModel):
@@ -82,8 +87,8 @@ class DraftSupportEmail(BaseModel):
             raise ValueError(
                 "must not contain placeholders such as [Your Name]; leave out anything unknown"
             )
-        last_line = value.splitlines()[-1].strip()
-        if _SIGN_OFF.match(last_line):
+        tail = [line.strip() for line in value.splitlines() if line.strip()][-_SIGN_OFF_WINDOW:]
+        if any(_SIGN_OFF.match(line) for line in tail):
             raise ValueError("must not end with a sign-off or name; the app adds those")
         return value
 
@@ -195,7 +200,8 @@ async def _draft_support_email(ctx: ToolContext, args: DraftSupportEmail) -> Dra
     )
     if new.replaced is not None:
         await retire_buttons(ctx, new.replaced)
-    intro = DRAFT_INTRO if new.replaced is None else REVISED_INTRO
+    # Version 1 is the first draft; anything later revises one the user has seen.
+    intro = DRAFT_INTRO if new.email.version == 1 else REVISED_INTRO
     await present_draft(ctx, new.email, intro=intro)
     return DraftShown(outbound_email_id=new.email.id, version=new.email.version)
 

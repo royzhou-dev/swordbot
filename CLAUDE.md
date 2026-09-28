@@ -5,7 +5,7 @@ The user reports an order problem over Telegram. The assistant gathers context (
 **What it is:** a durable workflow engine where an LLM proposes the next permitted action and chat is the user interface. It is **not** "an LLM conversation with Gmail access." The database owns all workflow state; the LLM context window owns none.
 
 - Full spec (authoritative for product behavior): [docs/SPEC.md](docs/SPEC.md)
-- Milestones, architectural decisions D1–D9, and open decisions: [docs/PLAN.md](docs/PLAN.md)
+- Milestones, architectural decisions D1–D14, and open decisions: [docs/PLAN.md](docs/PLAN.md)
 
 ## Milestone status
 
@@ -20,7 +20,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 | M4 | `LLMClient` abstraction (OpenAI + fake) | done |
 | M5 | Tool registry with risk levels + agent runtime + intake conversation | done |
 | M6 | Email drafting + Send/Edit/Cancel approval | done |
-| M7 | Gmail send + thread id stored → `WAITING_FOR_SUPPORT` (**Phase 1 done**) | not started |
+| M7 | Gmail send + thread id stored → `WAITING_FOR_SUPPORT` (**Phase 1 done**) | in progress: send path done against a fake Gmail (part 1); real Gmail client + OAuth next |
 | M7.5 | First cloud deployment | not started |
 | M8–M10 | Phase 2: receipt search, support-contact discovery, inbound email via Pub/Sub | not started |
 | M11–M12 | Phase 3: reply classification, approval policy engine, routine auto-replies | not started |
@@ -42,7 +42,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 - **Event flow:** a transport adapter (Telegram or Gmail webhook) validates the request, normalizes it into a `NewEvent`, calls `events.service.enqueue` (deduplicated on `(source, external_id)`), then returns 200. An in-process worker claims the event, loads the case, runs the handler/agent, persists, and stops. A user's events run one at a time, in order. The handler runs in the same transaction that marks the event done. Adapters never call the LLM or contain workflow logic. See PLAN D1.
 - **Scheduled work** (follow-ups, Gmail watch renewal) = `events` rows with a future `run_at`. Never use `sleep` or a long-running wait.
 - **State transitions** go only through `cases/state_machine.py`, which validates against `ALLOWED_TRANSITIONS` and writes to `case_transitions`. The LLM may *recommend* a transition; code decides.
-- **Send guard (D2):** `outbound_emails` status runs `awaiting_approval → approved → sending → sent`. An atomic conditional UPDATE to `sending` is required before calling Gmail. An approval is bound to the exact draft (`body_hash`), so any edit requires re-approval. A crashed `sending` is never re-sent automatically.
+- **Send guard (D2):** `outbound_emails` status runs `awaiting_approval → approved → sending → sent`. An atomic conditional UPDATE to `sending` is required before calling Gmail, **committed in its own transaction** (PLAN D14): sending is its own `SEND_EMAIL` event, and its handler writes nothing in the event's transaction before the claim. After the claim, only an error that proves Gmail didn't get the email may mark it `failed`; anything else is `needs_attention`. An approval is bound to the exact draft (`content_hash`: sha256 of recipient, subject and body), so any edit requires re-approval. A crashed `sending` is never re-sent automatically.
 - **Tool authorization** is enforced in the tool executor based on `ToolRiskLevel`, not in prompts. `REQUIRES_APPROVAL` tools require an approval record id.
 - **Buttons (D3):** `callback_data` = short `pending_actions.id` only. Validate that the action is open, belongs to this user, and matches the case state, then consume it (`actions.service.consume`).
 - **Telegram replies (D10):** handlers never call Telegram. They queue calls through `TelegramOutbox` (`app/telegram/delivery.py`), which become `telegram_outbound` events delivered by the worker.
@@ -58,7 +58,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 - Telegram and Gmail use thin `httpx` clients (no python-telegram-bot or google-api-python-client). See PLAN D4 before adding any dependency.
 - All schema changes go through Alembic migrations. Never call `create_all` at startup.
 - Typed exceptions per integration (`GmailTemporaryError`, `GmailAuthenticationError`, `LLMTemporaryError`, `InvalidAgentDecisionError`, …). Transient errors are retried with backoff; permanent errors mark the event `dead` and notify the user.
-- Layout follows `app/{api,agent,cases,events,email,telegram,web,llm,tools,db,users}/` plus `tests/{unit,integration}/` (see the SPEC).
+- Layout follows `app/{api,actions,agent,cases,chat,events,email,telegram,llm,tools,db,users}/` plus `tests/{unit,integration}/` (see the SPEC). `web/` arrives with M9.
 
 ## Commands
 

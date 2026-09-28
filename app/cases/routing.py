@@ -4,7 +4,8 @@ v1 routes by the user's focused case and its status:
 
 - gathering context or ready to draft: intake (corrections are welcome);
 - waiting for approval of a draft: draft review (M6);
-- approved and waiting to be sent: a fixed reply, handled in code;
+- approved (READY_TO_SEND): handled in code, no LLM; it settles whatever the
+  send left unfinished (`app.email.sending.resume_unfinished_send`);
 - anything else, or no focused case: intake with no case, which opens a new
   one if the message describes a problem.
 

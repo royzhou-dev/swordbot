@@ -20,8 +20,8 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.facts import Recorded, accept_fact, missing, record_fact
-from app.agent.policies import FALLBACK_QUESTIONS, IntakeField
-from app.agent.prompts import draft_messages, review_messages
+from app.agent.policies import CODE_FILLED, FALLBACK_QUESTIONS, IntakeField
+from app.agent.prompts import PreviousDraft, draft_messages, review_messages
 from app.agent.runtime import TurnOutcome, TurnResult, run_turn
 from app.agent.schemas import DraftReviewDecision
 from app.cases import messages as case_messages
@@ -56,6 +56,7 @@ REVIEW_TOOLS = frozenset({"draft_support_email", "reply_to_user", "ask_user"})
 HISTORY_LIMIT = 20
 
 REDRAFTING_REPLY = "Something went wrong with the draft, so I'm writing it again."
+REWRITING_REPLY = "Got it. I'll rewrite the email with that change."
 
 
 def drafting_tools() -> ToolRegistry:
@@ -112,8 +113,11 @@ class DraftingAgent:
             outbox=await TelegramOutbox.for_event(ctx),
             case=case,
         )
+        # A redraft sees the version it replaces, so the user's earlier edits carry over.
+        latest = await drafts.latest_version(ctx.session, case)
+        previous = PreviousDraft(latest.subject, latest.body_text) if latest else None
         email = await self._llm.extract_structured(
-            draft_messages(today=self._today(ctx), facts=facts),
+            draft_messages(today=self._today(ctx), facts=facts, previous=previous),
             DraftSupportEmail,
             purpose=PURPOSE_DRAFT,
         )
@@ -247,30 +251,42 @@ class _ReviewTurn:
         still_missing = missing(await case_service.get_current_facts(self.session, self.case))
         if still_missing:
             # The change needs more details (e.g. a new issue type): back to intake.
-            discarded = await drafts.discard_live(
-                self.session, self.case, to_status=OutboundEmailStatus.SUPERSEDED
-            )
-            if discarded is not None:
-                await retire_buttons(self.tools, discarded)
-            await transition(
-                self.session,
-                self.case,
-                CaseStatus.GATHERING_CONTEXT,
-                reason="more details needed",
-                actor=TransitionActor.SYSTEM,
-                event_id=self.ctx.event.id,
-            )
+            await self._retire_draft(CaseStatus.GATHERING_CONTEXT, "more details needed")
             return AskUser(tool="ask_user", question=FALLBACK_QUESTIONS[still_missing[0]])
 
         action = decision.action
-        if isinstance(action, ReplyToUser) and self.changed:
-            # A changed fact changes the email, at least its recipient or
-            # signature, which code fills in. Re-issue the current text as a
-            # new version so the old Send button can't approve stale details.
+        if not isinstance(action, ReplyToUser) or not self.changed:
+            return action
+        # A fact changed but the model only replied. The old Send button must
+        # not approve stale details either way.
+        if all(key in CODE_FILLED for key in self.changed):
+            # Only the recipient or signature, which code fills in: re-issue
+            # the current text as a new version.
             return DraftSupportEmail(
                 tool="draft_support_email", subject=self.email.subject, body=self.email.body_text
             )
-        return action
+        # The text itself states the old value: have it rewritten.
+        await self._retire_draft(CaseStatus.READY_TO_DRAFT, "a detail in the email changed")
+        await request_draft(
+            self.session, self.case, cause_event_id=self.ctx.event.id, now=self.ctx.now
+        )
+        return ReplyToUser(tool="reply_to_user", text=REWRITING_REPLY)
+
+    async def _retire_draft(self, to_status: CaseStatus, reason: str) -> None:
+        """Supersede the waiting draft, close its buttons, and move the case on."""
+        discarded = await drafts.discard_live(
+            self.session, self.case, to_status=OutboundEmailStatus.SUPERSEDED
+        )
+        if discarded is not None:
+            await retire_buttons(self.tools, discarded)
+        await transition(
+            self.session,
+            self.case,
+            to_status,
+            reason=reason,
+            actor=TransitionActor.SYSTEM,
+            event_id=self.ctx.event.id,
+        )
 
     async def conclude(self, result: TurnResult) -> None:
         if result.outcome is TurnOutcome.TOOL_ENDED and not isinstance(

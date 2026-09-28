@@ -59,6 +59,9 @@ class Settings(BaseSettings):
     google_client_secret: SecretStr | None = None
     google_redirect_uri: str | None = None
     gmail_refresh_token: SecretStr | None = None
+    # Your Gmail address, for the From header. The `gmail.send` scope can't read
+    # it, and the From display name follows each case's signature name.
+    gmail_sender_address: str | None = None
 
     @field_validator("telegram_webhook_secret")
     @classmethod

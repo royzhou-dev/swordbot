@@ -12,13 +12,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.actions.models import ActionKind, ActionStatus, PendingAction
-from app.agent.drafting import request_draft
+from app.agent.drafting import REWRITING_REPLY, request_draft
 from app.agent.policies import FALLBACK_QUESTIONS, Requirement
 from app.cases import service as case_service
 from app.cases.models import CaseStatus, TransitionActor
 from app.chat.handlers import (
     APPROVED_REPLY,
-    APPROVED_WAITING_REPLY,
     CANCELLED_REPLY,
     EDIT_PROMPT,
     KEPT_REPLY,
@@ -83,7 +82,8 @@ async def test_send_approves_exactly_the_shown_draft(
 
     assert h.callback_answer(callback) is None
     [draft] = await h.emails()
-    assert draft.status is S.APPROVED
+    # Approved, then sent by the queued send (test_sending_flow.py covers sending).
+    assert draft.status is S.SENT
     send_action = (
         await session.scalars(
             select(PendingAction).where(PendingAction.kind == ActionKind.SEND_EMAIL)
@@ -94,14 +94,15 @@ async def test_send_approves_exactly_the_shown_draft(
     assert draft.approved_by_event_id == send_action.consumed_by_event_id
 
     case = await h.only_case()
-    assert case.status is CaseStatus.READY_TO_SEND
-    last = (await case_service.list_transitions(session, case))[-1]
-    assert (last.from_status, last.to_status, last.actor) == (
-        CaseStatus.WAITING_FOR_USER_APPROVAL,
-        CaseStatus.READY_TO_SEND,
-        TransitionActor.USER,
-    )
-    assert h.telegram.sent_texts[-1] == APPROVED_REPLY.format(to=SUPPORT)
+    approval = [
+        t
+        for t in await case_service.list_transitions(session, case)
+        if t.to_status is CaseStatus.READY_TO_SEND
+    ]
+    assert [(t.from_status, t.actor) for t in approval] == [
+        (CaseStatus.WAITING_FOR_USER_APPROVAL, TransitionActor.USER)
+    ]
+    assert APPROVED_REPLY.format(to=SUPPORT) in h.telegram.sent_texts
 
 
 async def test_words_never_approve(database: Database, session: AsyncSession, user: User) -> None:
@@ -126,7 +127,7 @@ async def test_words_never_approve(database: Database, session: AsyncSession, us
 
     # The original Send button still works.
     await h.press(h.buttons()["Send"])
-    assert (await h.emails())[0].status is S.APPROVED
+    assert (await h.emails())[0].status is S.SENT
 
 
 async def test_an_edit_makes_the_old_send_button_stop_working(
@@ -158,7 +159,7 @@ async def test_an_edit_makes_the_old_send_button_stop_working(
 
     await h.press(new["Send"])
     v1, v2 = await h.emails()
-    assert (v1.status, v2.status) == (S.SUPERSEDED, S.APPROVED)
+    assert (v1.status, v2.status) == (S.SUPERSEDED, S.SENT)
 
 
 async def test_a_change_typed_without_pressing_edit_retires_the_old_buttons(
@@ -202,7 +203,7 @@ async def test_a_double_pressed_send_approves_once(
     assert h.callback_answer(first) is None
     assert h.callback_answer(second) == STALE_BUTTON_REPLY
     [draft] = await h.emails()
-    assert draft.status is S.APPROVED
+    assert draft.status is S.SENT
     case = await h.only_case()
     to_ready = [
         t
@@ -227,7 +228,7 @@ async def test_edit_then_never_mind_shows_the_draft_again(
     assert h.telegram.sent_texts[-1].startswith(REPEAT_INTRO)
     await h.press(h.buttons()["Send"])
     [draft] = await h.emails()
-    assert draft.status is S.APPROVED
+    assert draft.status is S.SENT
     assert draft.version == 1
 
 
@@ -292,13 +293,84 @@ async def test_a_new_address_or_name_makes_a_new_version(
     assert (await h.only_case()).support_email == "help@doordash.com"
 
 
+async def test_a_corrected_detail_in_the_text_rewrites_the_email(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session)
+    await h.reach_draft(
+        subject="Missing fries from order #A123",
+        body="Hi,\n\nMy order #A123 was missing the fries.\n\nCould you refund them?",
+    )
+    old_send = h.buttons()["Send"]
+
+    # The model records the correction but only replies, leaving #A123 in the text.
+    fixed = "Hi,\n\nMy order #B777 was missing the fries.\n\nCould you refund them?"
+    h.llm.script(
+        reply("Got it, updated.", order_number="B777"),
+        email(subject="Missing fries from order #B777", body=fixed),
+    )
+    await h.say("sorry, the order number is actually B777")
+
+    v1, v2 = await h.emails()
+    assert (v1.status, v2.status) == (S.SUPERSEDED, S.AWAITING_APPROVAL)
+    assert "B777" in v2.subject and v2.body_text == fixed
+    v2_created_by = v2.created_by_event_id
+    case = await h.only_case()
+    assert case.status is CaseStatus.WAITING_FOR_USER_APPROVAL
+    assert case.order_number == "B777"
+    # The text was rewritten by a drafting event, not re-issued unchanged.
+    review_event = (
+        await session.scalars(
+            select(Event).where(Event.type == EventType.USER_MESSAGE).order_by(Event.id)
+        )
+    ).all()[-1]
+    redraft = (
+        await session.scalars(
+            select(Event).where(Event.type == EventType.DRAFT_EMAIL).order_by(Event.id)
+        )
+    ).all()[-1]
+    assert v2_created_by == redraft.id
+    assert redraft.external_id.endswith(f":{review_event.id}")
+    assert [t.to_status for t in await case_service.list_transitions(session, case)][-2:] == [
+        CaseStatus.READY_TO_DRAFT,
+        CaseStatus.WAITING_FOR_USER_APPROVAL,
+    ]
+    # The user was told, the drafter saw the version it replaces, and it was shown as updated.
+    assert REWRITING_REPLY in h.telegram.sent_texts
+    draft_call = h.llm.calls[-1]
+    assert draft_call.purpose == "draft_email"
+    assert '<data name="previous_draft">' in draft_call.messages[1].content
+    assert h.telegram.sent_texts[-1].startswith(REVISED_INTRO)
+    # The old Send button approves nothing.
+    callback = await h.press(old_send)
+    assert h.callback_answer(callback) == STALE_BUTTON_REPLY
+
+
+async def test_a_corrected_detail_the_model_rewrites_needs_no_extra_draft(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session)
+    await h.reach_draft()
+
+    fixed = "Hi,\n\nMy order #B777 was missing the fries.\n\nCould you refund them?"
+    h.llm.script(revise(body=fixed, order_number="B777"))
+    await h.say("the order number is B777")
+
+    v1, v2 = await h.emails()
+    assert (v1.status, v2.status) == (S.SUPERSEDED, S.AWAITING_APPROVAL)
+    assert v2.body_text == fixed
+    drafts = (await session.scalars(select(Event).where(Event.type == EventType.DRAFT_EMAIL))).all()
+    assert len(drafts) == 1  # only the first draft's
+    assert h.llm.unused_replies == 0
+
+
 async def test_a_change_needing_more_details_goes_back_to_intake(
     database: Database, session: AsyncSession, user: User
 ) -> None:
     h = Harness(database, session)
     await h.reach_draft()
 
-    h.llm.script(reply("Oh no.", issue_type="damaged_item"))
+    h.llm.script(reply("Oh no.", issue_type=("damaged_item", "the fries were crushed")))
     await h.say("wait, they weren't missing, the fries were crushed")
 
     case = await h.only_case()
@@ -315,21 +387,6 @@ async def test_a_change_needing_more_details_goes_back_to_intake(
     assert case.status is CaseStatus.WAITING_FOR_USER_APPROVAL
     v1, v2 = await h.emails()
     assert (v1.status, v2.status) == (S.SUPERSEDED, S.AWAITING_APPROVAL)
-
-
-async def test_an_approved_email_cant_be_changed_from_chat(
-    database: Database, session: AsyncSession, user: User
-) -> None:
-    h = Harness(database, session)
-    await h.reach_draft()
-    await h.press(h.buttons()["Send"])
-    calls_before = len(h.llm.calls)
-
-    await h.say("change the subject please")
-
-    assert h.telegram.sent_texts[-1] == APPROVED_WAITING_REPLY
-    assert len(h.llm.calls) == calls_before
-    assert (await h.emails())[0].status is S.APPROVED
 
 
 async def test_duplicate_draft_events_draft_once(

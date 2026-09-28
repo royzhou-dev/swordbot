@@ -1,7 +1,9 @@
 """Test doubles for external services."""
 
+import asyncio
 import uuid
 from collections import defaultdict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -10,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import utcnow
+from app.email.gmail_client import GmailSent
 from app.events.models import EventSource, EventType
 from app.events.schemas import ClaimedEvent
 from app.llm.client import Message
@@ -93,6 +96,58 @@ class FakeTelegramClient:
 
     async def delete_webhook(self, *, drop_pending_updates: bool = False) -> None:
         self._record("delete_webhook", drop_pending_updates=drop_pending_updates)
+
+
+class FakeGmailClient:
+    """Records sent messages. Failures are scripted per call:
+
+    - `fail_authorize(*errors)`: the next `authorize` calls raise (nothing sent);
+    - `fail_send(*errors)`: the next sends raise *without* Gmail getting the message;
+    - `accept_then(*outcomes)`: the next sends reach Gmail (recorded in `sent`),
+      then raise the given error, or hang for the given number of seconds.
+
+    `on_send`, if set, runs at the start of every send, e.g. to check what the
+    database looks like at the moment Gmail is called.
+    """
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.authorize_calls = 0
+        self.on_send: Callable[[], Awaitable[None]] | None = None
+        self._authorize_errors: list[Exception] = []
+        self._send_errors: list[Exception] = []
+        self._after_accept: list[Exception | float] = []
+
+    def fail_authorize(self, *errors: Exception) -> None:
+        self._authorize_errors.extend(errors)
+
+    def fail_send(self, *errors: Exception) -> None:
+        self._send_errors.extend(errors)
+
+    def accept_then(self, *outcomes: Exception | float) -> None:
+        self._after_accept.extend(outcomes)
+
+    async def authorize(self) -> None:
+        self.authorize_calls += 1
+        if self._authorize_errors:
+            raise self._authorize_errors.pop(0)
+
+    async def send(self, raw: bytes) -> GmailSent:
+        if self.on_send is not None:
+            await self.on_send()
+        if self._send_errors:
+            raise self._send_errors.pop(0)
+        self.sent.append(raw)
+        number = len(self.sent)
+        if self._after_accept:
+            outcome = self._after_accept.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            await asyncio.sleep(outcome)
+        return GmailSent(message_id=f"gmail-msg-{number}", thread_id=f"gmail-thread-{number}")
+
+    async def aclose(self) -> None:
+        return None
 
 
 @dataclass(frozen=True)

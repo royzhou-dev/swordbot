@@ -30,6 +30,15 @@ class FinishIntake(StopAction):
 
 class FactUpdate(BaseModel):
     key: IntakeField = Field(description="Which fact this is.")
+    # Before `value`, so the model quotes the user first and normalizes second.
+    quote: str = Field(
+        description=(
+            "The user's own words from their latest message that state this fact, copied "
+            "exactly as one continuous quote: for example 'last night' for an order date, "
+            "or 'I want my money back' for a refund. If you can't quote the user's latest "
+            "message, leave the fact out."
+        )
+    )
     value: str = Field(
         description=(
             "The value exactly as the user stated it. Never guess or infer. "
@@ -45,9 +54,9 @@ class FactUpdate(BaseModel):
         )
     )
 
-    @field_validator("value")
+    @field_validator("quote", "value")
     @classmethod
-    def _value(cls, value: str) -> str:
+    def _bounded(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("must not be empty")

@@ -142,7 +142,7 @@ async def test_the_model_finishing_early_gets_a_fallback_question(
     database: Database, session: AsyncSession, user: User
 ) -> None:
     h = Harness(database, session)
-    h.llm.script(finish(merchant_name="Amazon", issue_type="damaged_item"))
+    h.llm.script(finish(merchant_name="Amazon", issue_type=("damaged_item", "showed up damaged")))
     await h.say("My Amazon package showed up damaged")
 
     case = await h.only_case()
@@ -183,6 +183,36 @@ async def test_a_support_address_the_user_never_typed_is_not_recorded(
     assert "support_email" not in await h.current(await h.only_case())
 
 
+async def test_an_order_date_the_user_never_gave_is_not_recorded(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session)
+    # The model assumes "today" and points at words that don't say when.
+    h.llm.script(
+        ask(
+            merchant_name="DoorDash",
+            issue_type=("missing_item", "missing the fries"),
+            order_date=(h.today, "My DoorDash order"),
+        )
+    )
+    await h.say("My DoorDash order was missing the fries")
+
+    known = await h.current(await h.only_case())
+    assert "order_date" not in known
+    assert set(known) == {"merchant_name", "issue_type"}
+
+
+async def test_a_fact_the_user_never_stated_is_not_recorded(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session)
+    # A resolution the user never asked for, "quoted" with words they never wrote.
+    h.llm.script(ask(merchant_name="DoorDash", desired_resolution=("refund", "I want a refund")))
+    await h.say("DoorDash forgot my fries")
+
+    assert set(await h.current(await h.only_case())) == {"merchant_name"}
+
+
 async def test_a_failed_draft_is_retried_by_the_next_message(
     database: Database, session: AsyncSession, user: User
 ) -> None:
@@ -219,7 +249,11 @@ async def test_a_new_requirement_sends_the_case_back_to_gathering(
     h.llm.script(
         ask(**complaint_facts(h.today)),
         # Changes the issue type in the same message that completes intake.
-        ask("Which items were damaged?", desired_resolution="refund", issue_type="damaged_item"),
+        ask(
+            "Which items were damaged?",
+            desired_resolution="refund",
+            issue_type=("damaged_item", "the fries were crushed"),
+        ),
     )
     await h.say(COMPLAINT)
     await h.say("refund. oh and they weren't missing, the fries were crushed")
@@ -266,7 +300,10 @@ async def test_a_message_goes_to_the_focused_intake_case(
     database: Database, session: AsyncSession, user: User
 ) -> None:
     h = Harness(database, session)
-    h.llm.script(ask(merchant_name="DoorDash"), ask("And the order?", issue_type="missing_item"))
+    h.llm.script(
+        ask(merchant_name="DoorDash"),
+        ask("And the order?", issue_type=("missing_item", "forgot the fries")),
+    )
     await h.say(COMPLAINT)
     await h.say("they forgot the fries")
 

@@ -28,6 +28,9 @@ class ActionKind(StrEnum):
     SEND_EMAIL = "send_email"
     EDIT_DRAFT = "edit_draft"
     CANCEL_DRAFT = "cancel_draft"
+    # After a send whose outcome is unknown (M7): the user checked Gmail's Sent folder.
+    CONFIRM_SENT = "confirm_sent"
+    CONFIRM_NOT_SENT = "confirm_not_sent"
 
 
 class ActionStatus(StrEnum):

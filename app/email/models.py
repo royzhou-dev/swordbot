@@ -21,11 +21,14 @@ class OutboundEmailStatus(StrEnum):
     AWAITING_APPROVAL = "awaiting_approval"
     # The user pressed Send for exactly this content.
     APPROVED = "approved"
-    # M7: claimed for sending by an atomic conditional update. Never re-sent automatically.
+    # Claimed for sending by an atomic conditional update, committed before Gmail
+    # is called (PLAN D14). Never re-sent automatically.
     SENDING = "sending"
+    # Gmail accepted it, or the user confirmed it went out.
     SENT = "sent"
+    # Certainly not sent (Gmail refused, or never reached). Offered again as a new version.
     FAILED = "failed"
-    # M7: a send crashed midway; the user decides what happens.
+    # A send whose outcome is unknown; the user checks Gmail and tells us.
     NEEDS_ATTENTION = "needs_attention"
     # Replaced by a later version, or discarded because the case went back to intake.
     SUPERSEDED = "superseded"
@@ -81,6 +84,15 @@ class OutboundEmail(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     approved_by_action_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("pending_actions.id")
     )
+
+    # The RFC 822 Message-ID we give the email, so a send whose outcome is
+    # unknown can be looked up in Gmail's Sent folder (M8). Set at creation.
+    rfc822_message_id: Mapped[str | None] = mapped_column(String(255))
+    # Gmail's ids, once Gmail accepted the email. Unknown (None) when the user
+    # confirmed a send whose outcome we couldn't see.
+    gmail_message_id: Mapped[str | None] = mapped_column(String(64))
+    gmail_thread_id: Mapped[str | None] = mapped_column(String(64))
+    sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime)
 
     __table_args__ = (
         UniqueConstraint("case_id", "version"),

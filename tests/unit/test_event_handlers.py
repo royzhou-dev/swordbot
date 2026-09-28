@@ -7,13 +7,14 @@ import pytest
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.session import Database
 from app.events.errors import InvalidEventPayloadError, UnknownEventTypeError
 from app.events.handlers import HandlerContext, HandlerRegistry
 from app.events.models import EventSource, EventType
 from app.events.routing import build_registry
 from app.events.schemas import ClaimedEvent
 from app.logging import get_logger
-from tests.fakes import FakeLLMClient, FakeTelegramClient
+from tests.fakes import FakeGmailClient, FakeLLMClient, FakeTelegramClient
 
 
 class Greeting(BaseModel):
@@ -82,11 +83,18 @@ def test_registering_a_type_twice_is_an_error() -> None:
 
 
 def test_default_registry_handles_chat_events() -> None:
-    registry = build_registry(FakeTelegramClient(), FakeLLMClient(), user_timezone=ZoneInfo("UTC"))
+    registry = build_registry(
+        FakeTelegramClient(),
+        FakeLLMClient(),
+        gmail=FakeGmailClient(),
+        database=cast(Database, None),
+        user_timezone=ZoneInfo("UTC"),
+    )
     for event_type in (
         EventType.USER_MESSAGE,
         EventType.USER_BUTTON_ACTION,
         EventType.DRAFT_EMAIL,
+        EventType.SEND_EMAIL,
         EventType.TELEGRAM_OUTBOUND,
     ):
         assert registry.handles(event_type)

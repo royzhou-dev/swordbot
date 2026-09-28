@@ -2,7 +2,7 @@
 
 A personal customer-support assistant. You describe an order problem to a Telegram bot ("My DoorDash order was missing the fries"). The bot works out the details, drafts an email to the merchant's support team, and sends it from your Gmail only after you press **Send**. When support replies, the bot picks the case back up. It asks you before making any consequential decision, such as accepting store credit instead of a refund.
 
-> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer and the intake conversation exist. Tell the bot about an order problem and it asks for what's missing until the case is ready to draft. Drafting and sending the email come next. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
+> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer, the intake conversation, and drafting with **[Send] [Edit] [Cancel]** approval exist. Tell the bot about an order problem, answer its questions, and it shows you the email it would send. The send path is built and tested against a stand-in for Gmail; connecting your real Gmail account (M7 part 2) comes next. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
 ## Architecture
 
@@ -51,7 +51,7 @@ To change the schema:
 3. Review the generated file by hand. Keep it portable (no Postgres-only types), since it also runs on SQLite.
 4. `uv run alembic upgrade head`, then `uv run alembic check` should report no differences. The test suite checks this too.
 
-Main tables so far: `users`, `support_cases` (status, fact-backed fields, optimistic-lock `version`), `case_facts` (append-only facts with `source` provenance), `case_transitions` (audit log of every status change), `events` (the inbox and job queue, below) and `pending_actions` (the records behind chat buttons). The allowed status transitions are listed in [docs/PLAN.md](docs/PLAN.md#case-state-machine).
+Main tables so far: `users`, `support_cases` (status, fact-backed fields, optimistic-lock `version`), `case_facts` (append-only facts with `source` provenance), `case_transitions` (audit log of every status change), `events` (the inbox and job queue, below), `pending_actions` (the records behind chat buttons), `case_messages` (the chat about each case, kept as LLM context; not workflow state) and `outbound_emails` (one row per email version, with its approval bound to a hash of its content). The allowed status transitions are listed in [docs/PLAN.md](docs/PLAN.md#case-state-machine).
 
 ## Events and the worker
 
@@ -99,6 +99,7 @@ With SQLite the worker handles one event at a time, and a long handler holds SQL
 | `TELEGRAM_API_BASE_URL` | Bot API base URL (default `https://api.telegram.org`) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Gmail OAuth client |
 | `GMAIL_REFRESH_TOKEN` | Produced by the one-time OAuth script (M7) |
+| `GMAIL_SENDER_ADDRESS` | Your Gmail address, for the From header (the `gmail.send` scope can't read it). The display name follows each case's signature name. Without it, Gmail fills in From itself |
 
 Secrets are loaded as `SecretStr` and are never logged. Log output also passes through a redaction step (`app/logging.py`).
 
@@ -129,7 +130,7 @@ Tell the bot what went wrong in plain words. It opens a **case**, records each d
 What "what it needs" means is decided in code ([app/agent/policies.py](app/agent/policies.py)), not by the model. Every case needs the kind of problem, a short description, the merchant, what you want done (refund, replacement, ...) and the merchant's **support email address**, which you type in until address lookup arrives (M9). Order problems also need the order (an order number **or** the date you ordered), and for missing, wrong or damaged items, which items.
 
 - **One model call per message.** The model returns the facts it found in your message and a proposed next step. Code records the facts, recomputes what's missing and decides: the model's question, a fallback question of its own, or "drafting now". Only code moves a case between "gathering context" and "ready to draft".
-- **No invented details.** Facts are only what you said. An order number, support address or name the model reports is dropped unless it appears in your message, a support address must look like one, and an order date must be a real date that isn't in the future.
+- **No invented details.** Facts are only what you said: the model must quote your words for every detail it records, and a detail whose quote isn't in your message is dropped. An order date needs words that say when ("last night", "on the 23rd"). An order number, support address or name the model reports is dropped unless it appears in your message, a support address must look like one, and an order date must be a real date that isn't in the future.
 - **Corrections.** Send a correction any time ("actually it was order #A123"). The new value is recorded alongside the old one.
 - **Small talk** ("hi", "thanks") gets a short reply and opens no case.
 - **Commands.** `/help` (or `/start`) explains the bot. `/cancel` offers to cancel the case you're working on, with **[Yes, cancel] [Keep it]** buttons. Only the button cancels, and nothing is sent to support.
@@ -153,12 +154,24 @@ Your Name
 ```
 
 - **The model writes the subject and body; code does the rest.** The recipient is the support address you gave, and the sign-off is added by code: by default your Telegram name (first and last, kept up to date from your messages). If an order is under another name, say so ("the order is under Alex Kim, sign it with that") and that name signs this case's emails only. Drafts with placeholders like `[Your Name]` are rejected and the model gets one chance to fix them.
-- **Send** approves exactly the email on screen. The approval is bound to a hash of the recipient, subject and body, so it can't carry over to anything else. Pressing Send twice approves once. **Sending itself arrives in M7**: for now the case stops at "approved, ready to send".
-- **Edit**, or simply typing a change ("make it shorter", "ask for a replacement instead"), makes the bot write a new version with new buttons. The old version's buttons stop working. A detail you change here (a new support address, order number or name) is recorded as a fact too. If the change needs more information (say, the fries were crushed, not missing), the case goes back to intake for it.
+- **Send** approves exactly the email on screen. The approval is bound to a hash of the recipient, subject and body, so it can't carry over to anything else. Pressing Send twice approves once. Approving queues the send (see "Sending" below).
+- **Edit**, or simply typing a change ("make it shorter", "ask for a replacement instead"), makes the bot write a new version with new buttons. The old version's buttons stop working. A detail you change here (a new support address, order number or name) is recorded as a fact too, and the email is always rewritten to match: a new address or name just re-addresses or re-signs it, while any other detail gets the text rewritten, keeping your earlier edits. If the change needs more information (say, the fries were crushed, not missing), the case goes back to intake for it.
 - **Typing approval does nothing.** "Looks good, send it" gets a reply telling you to tap Send. The draft-review step can only write a new version or reply; approving isn't among its options, and only the Send button reaches the approval code.
 - **Cancel** asks for confirmation (**[Yes, cancel] [Keep it]**). Cancelling the case also cancels its draft. "Keep it" brings the draft back with working buttons.
 
-Every version is kept in `outbound_emails` with its status (`awaiting_approval`, `approved`, `superseded`, `cancelled`; `sending`, `sent`, `failed` and `needs_attention` arrive with M7), who approved it and when (PLAN D2 and D13).
+Every version is kept in `outbound_emails` with its status (`awaiting_approval`, `approved`, `sending`, `sent`, `failed`, `needs_attention`, `superseded`, `cancelled`), who approved it and when (PLAN D2 and D13).
+
+## Sending
+
+After you press **Send**, the email goes out from your Gmail as its own step, and the bot tells you what was sent and to whom. The case then waits for support's reply. **The real Gmail connection is M7 part 2**: until then every send reports "Gmail isn't connected", nothing goes out, and the email is offered again.
+
+A send never happens twice (PLAN D14). Before calling Gmail, the bot commits a claim on the email (`approved → sending`) in its own transaction. After that:
+
+- **Gmail accepted it:** the email is `sent`, with Gmail's message and thread ids.
+- **It certainly didn't go out** (Gmail refused it, access was revoked, or Gmail couldn't be reached): the email is `failed` and shown again with fresh buttons. Trying again takes another Send press.
+- **Anything else** (a timeout, a server error, a crash after Gmail may have accepted it): the email is `needs_attention`, and the bot asks you to check Gmail's Sent folder: **[It was sent]** or **[It wasn't sent]**. It never retries on its own.
+
+If a send gives up before reaching Gmail (say, Gmail was unreachable for half an hour), your next message gets the email offered again. `/cancel` while a send's outcome is unknown cancels the case and warns you the email may already have gone out.
 
 ## Gmail OAuth setup
 

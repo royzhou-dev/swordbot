@@ -101,8 +101,21 @@ def test_an_unrecognized_stored_issue_type_counts_as_other() -> None:
 # --- Fact validation ---------------------------------------------------------------
 
 
-def _accept(key: IntakeField, value: str, message: str = "") -> object:
-    return accept_fact(FactUpdate(key=key, value=value), message_text=message, today=TODAY)
+def _accept(key: IntakeField, value: str, message: str, quote: str | None = None) -> object:
+    """Accept a fact; by default the model quotes the value itself."""
+    update = FactUpdate(key=key, quote=quote or value, value=value)
+    return accept_fact(update, message_text=message, today=TODAY)
+
+
+@pytest.mark.parametrize("key", list(IntakeField))
+def test_every_fact_must_quote_the_message(key: IntakeField) -> None:
+    message = "DoorDash forgot my fries"
+    assert _accept(key, "refund", message, quote="I want a refund") is None
+
+
+def test_quotes_ignore_case_spacing_and_curly_quotes() -> None:
+    message = "I" + chr(0x2019) + "d like  a REFUND please"
+    assert _accept(F.DESIRED_RESOLUTION, "refund", message, quote="i'd like a refund") == "refund"
 
 
 def test_an_order_number_must_appear_in_the_message() -> None:
@@ -114,24 +127,46 @@ def test_an_order_number_must_appear_in_the_message() -> None:
 
 
 def test_an_order_date_must_be_iso_and_not_in_the_future() -> None:
-    assert _accept(F.ORDER_DATE, "2026-09-26") == TODAY
-    assert _accept(F.ORDER_DATE, "2026-09-27") is None
-    assert _accept(F.ORDER_DATE, "last tuesday") is None
+    message = "I ordered it today"
+    assert _accept(F.ORDER_DATE, "2026-09-26", message, quote="today") == TODAY
+    assert _accept(F.ORDER_DATE, "2026-09-27", message, quote="today") is None
+    assert _accept(F.ORDER_DATE, "last tuesday", "last tuesday") is None
+
+
+@pytest.mark.parametrize(
+    ("message", "quote"),
+    [
+        ("I ordered it yesterday", "yesterday"),
+        ("it came last night", "last night"),
+        ("ordered on the 23rd", "on the 23rd"),
+        ("placed it last Friday", "last Friday"),
+        ("back on Sept 20", "Sept 20"),
+        ("a couple of days ago", "a couple of days ago"),
+    ],
+)
+def test_an_order_date_quote_says_when(message: str, quote: str) -> None:
+    assert _accept(F.ORDER_DATE, "2026-09-20", message, quote=quote) == date(2026, 9, 20)
+
+
+def test_an_order_date_without_a_date_in_the_quote_is_dropped() -> None:
+    # The model assumed "today" from a message that never says when.
+    message = "My DoorDash order was missing the fries"
+    assert _accept(F.ORDER_DATE, "2026-09-26", message, quote="My DoorDash order") is None
 
 
 def test_issue_types_are_normalized() -> None:
-    assert _accept(F.ISSUE_TYPE, "Missing item") == "missing_item"
-    assert _accept(F.ISSUE_TYPE, "late-delivery") == "late_delivery"
-    assert _accept(F.ISSUE_TYPE, "lost parcel") == "other"
+    assert _accept(F.ISSUE_TYPE, "Missing item", "Missing item") == "missing_item"
+    assert _accept(F.ISSUE_TYPE, "late-delivery", "late-delivery") == "late_delivery"
+    assert _accept(F.ISSUE_TYPE, "lost parcel", "lost parcel") == "other"
 
 
 def test_a_support_address_must_be_typed_and_look_like_an_address() -> None:
     message = "Their email is Support@DoorDash.com I think"
     assert _accept(F.SUPPORT_EMAIL, "Support@DoorDash.com", message) == "Support@DoorDash.com"
     assert _accept(F.SUPPORT_EMAIL, "support@doordash.com", message) == "support@doordash.com"
-    assert _accept(F.SUPPORT_EMAIL, "mailto:support@doordash.com", message) == (
-        "support@doordash.com"
-    )
+    assert _accept(
+        F.SUPPORT_EMAIL, "mailto:support@doordash.com", message, quote="Support@DoorDash.com"
+    ) == ("support@doordash.com")
     # Invented, or not an address.
     assert _accept(F.SUPPORT_EMAIL, "help@doordash.com", message) is None
     assert _accept(F.SUPPORT_EMAIL, "support@doordash", "support@doordash") is None
@@ -147,17 +182,18 @@ def test_a_signature_name_must_be_typed() -> None:
 
 
 def test_other_facts_are_taken_as_stated() -> None:
-    assert _accept(F.MISSING_ITEMS, " fries, coke ") == "fries, coke"
+    message = "they forgot the fries, coke"
+    assert _accept(F.MISSING_ITEMS, " fries, coke ", message) == "fries, coke"
 
 
-def test_decisions_reject_blank_and_oversized_values() -> None:
+@pytest.mark.parametrize("field", ["quote", "value"])
+def test_decisions_reject_blank_and_oversized_values(field: str) -> None:
     base = {"action": {"tool": "finish_intake"}, "reason": "r"}
+    fact = {"key": "merchant_name", "quote": "DoorDash", "value": "DoorDash"}
     with pytest.raises(ValueError, match="empty"):
-        IntakeDecision.model_validate({**base, "facts": [{"key": "merchant_name", "value": " "}]})
+        IntakeDecision.model_validate({**base, "facts": [{**fact, field: " "}]})
     with pytest.raises(ValueError, match="at most"):
-        IntakeDecision.model_validate(
-            {**base, "facts": [{"key": "merchant_name", "value": "x" * 1001}]}
-        )
+        IntakeDecision.model_validate({**base, "facts": [{**fact, field: "x" * 1001}]})
 
 
 def test_questions_are_bounded() -> None:

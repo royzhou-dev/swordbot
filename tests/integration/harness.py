@@ -23,7 +23,14 @@ from app.events.worker import EventWorker
 from app.telegram.ingest import ingest_update
 from app.telegram.keyboards import decode_callback_data
 from app.telegram.notifier import TelegramDeadEventNotifier
-from tests.fakes import Clock, FakeLLMClient, FakeTelegramClient, callback_update, message_update
+from tests.fakes import (
+    Clock,
+    FakeGmailClient,
+    FakeLLMClient,
+    FakeTelegramClient,
+    callback_update,
+    message_update,
+)
 
 OWNER = 1_000_000_001  # the `user` fixture's Telegram id
 
@@ -38,23 +45,33 @@ BODY = "Hi,\n\nMy DoorDash order tonight was missing the fries.\n\nCould you ref
 # --- Decisions the fake LLM returns -----------------------------------------------
 
 
-def _decision(action: dict[str, Any], **facts: str) -> dict[str, Any]:
+# A fact the model reports: its value, or `(value, quote)` when the value isn't
+# the user's exact words. A bare value quotes itself.
+type Fact = str | tuple[str, str]
+
+
+def _fact(key: str, fact: Fact) -> dict[str, str]:
+    value, quote = fact if isinstance(fact, tuple) else (fact, fact)
+    return {"key": key, "quote": quote, "value": value}
+
+
+def _decision(action: dict[str, Any], **facts: Fact) -> dict[str, Any]:
     return {
-        "facts": [{"key": key, "value": value} for key, value in facts.items()],
+        "facts": [_fact(key, fact) for key, fact in facts.items()],
         "action": action,
         "reason": "test",
     }
 
 
-def ask(question: str = QUESTION, **facts: str) -> dict[str, Any]:
+def ask(question: str = QUESTION, **facts: Fact) -> dict[str, Any]:
     return _decision({"tool": "ask_user", "question": question}, **facts)
 
 
-def reply(text: str, **facts: str) -> dict[str, Any]:
+def reply(text: str, **facts: Fact) -> dict[str, Any]:
     return _decision({"tool": "reply_to_user", "text": text}, **facts)
 
 
-def finish(**facts: str) -> dict[str, Any]:
+def finish(**facts: Fact) -> dict[str, Any]:
     return _decision({"tool": "finish_intake"}, **facts)
 
 
@@ -63,32 +80,49 @@ def email(subject: str = SUBJECT, body: str = BODY) -> dict[str, Any]:
     return {"tool": "draft_support_email", "subject": subject, "body": body}
 
 
-def revise(subject: str = SUBJECT, body: str = BODY, **facts: str) -> dict[str, Any]:
+def revise(subject: str = SUBJECT, body: str = BODY, **facts: Fact) -> dict[str, Any]:
     """A draft-review decision that writes a new version."""
     return _decision(email(subject, body), **facts)
 
 
-def complaint_facts(today: str) -> dict[str, str]:
+def complaint_facts(today: str) -> dict[str, Fact]:
+    """What the model reads in COMPLAINT, each with the words it quotes."""
     return {
         "merchant_name": "DoorDash",
-        "issue_type": "missing_item",
-        "issue_summary": "The order was missing the fries.",
-        "order_date": today,
+        "issue_type": ("missing_item", "missing the fries"),
+        "issue_summary": (
+            "The order was missing the fries.",
+            "order tonight was missing the fries",
+        ),
+        "order_date": (today, "tonight"),
         "missing_items": "fries",
     }
 
 
+SENDER = "me@example.com"
+
+
 class Harness:
-    def __init__(self, database: Database, session: AsyncSession) -> None:
+    def __init__(
+        self, database: Database, session: AsyncSession, *, policy: EventPolicy | None = None
+    ) -> None:
         self.database = database
         self.session = session
         self.telegram = FakeTelegramClient()
         self.llm = FakeLLMClient()
+        self.gmail = FakeGmailClient()
         self.clock = Clock()
         self.worker = EventWorker(
             database,
-            build_registry(self.telegram, self.llm, user_timezone=ZoneInfo("UTC")),
-            EventPolicy(),
+            build_registry(
+                self.telegram,
+                self.llm,
+                gmail=self.gmail,
+                database=database,
+                user_timezone=ZoneInfo("UTC"),
+                sender_address=SENDER,
+            ),
+            policy or EventPolicy(),
             notifier=TelegramDeadEventNotifier(database),
             poll_interval=0.01,
             clock=self.clock,

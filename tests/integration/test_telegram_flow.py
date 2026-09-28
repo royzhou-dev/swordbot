@@ -41,7 +41,14 @@ from app.telegram.ingest import ingest_update
 from app.telegram.keyboards import encode_callback_data
 from app.telegram.notifier import TelegramDeadEventNotifier
 from app.users.models import User
-from tests.fakes import Clock, FakeLLMClient, FakeTelegramClient, callback_update, message_update
+from tests.fakes import (
+    Clock,
+    FakeGmailClient,
+    FakeLLMClient,
+    FakeTelegramClient,
+    callback_update,
+    message_update,
+)
 
 OWNER = 1_000_000_001  # the `user` fixture's Telegram id
 
@@ -54,7 +61,13 @@ def _worker(
 ) -> EventWorker:
     return EventWorker(
         database,
-        build_registry(telegram, llm or FakeLLMClient(), user_timezone=ZoneInfo("UTC")),
+        build_registry(
+            telegram,
+            llm or FakeLLMClient(),
+            gmail=FakeGmailClient(),
+            database=database,
+            user_timezone=ZoneInfo("UTC"),
+        ),
         EventPolicy(),
         notifier=TelegramDeadEventNotifier(database),
         poll_interval=0.01,

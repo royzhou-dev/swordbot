@@ -27,6 +27,9 @@ class EventType(StrEnum):
     # Draft a case's email once intake has everything (M6). Its own event, so a
     # drafting failure retries only the drafting.
     DRAFT_EMAIL = "draft_email"
+    # Send an approved email (M7). Its own event, queued by the Send press, so
+    # its claim can commit before Gmail is called (PLAN D14).
+    SEND_EMAIL = "send_email"
 
 
 class EventSource(StrEnum):

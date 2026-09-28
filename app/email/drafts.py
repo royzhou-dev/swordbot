@@ -14,6 +14,7 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from email.utils import make_msgid
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cases.models import SupportCase
 from app.db.session import rowcount
-from app.email.errors import DraftLockedError
+from app.email.errors import DraftLockedError, UnknownEmailError
 from app.email.models import LIVE_STATUSES, OutboundEmail, OutboundEmailStatus
 from app.logging import get_logger
 
@@ -29,12 +30,18 @@ log = get_logger(__name__)
 
 S = OutboundEmailStatus
 SIGN_OFF = "Thank you,"
+MESSAGE_ID_DOMAIN = "swordbot.invalid"
 
 
 def content_hash(to_address: str, subject: str, body: str) -> str:
     """The hash an approval is bound to. Any change to recipient, subject or body changes it."""
     canonical = json.dumps([to_address, subject, body], ensure_ascii=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def new_message_id() -> str:
+    """A fresh RFC 822 Message-ID. A fixed domain: the default would expose the host name."""
+    return make_msgid(domain=MESSAGE_ID_DOMAIN)
 
 
 def compose_body(body_text: str, signature_name: str | None) -> str:
@@ -56,6 +63,16 @@ async def live_email(session: AsyncSession, case: SupportCase) -> OutboundEmail 
         select(OutboundEmail).where(
             OutboundEmail.case_id == case.id, OutboundEmail.status.in_(LIVE_STATUSES)
         )
+    )
+
+
+async def latest_version(session: AsyncSession, case: SupportCase) -> OutboundEmail | None:
+    """The case's most recent email version, whatever its status."""
+    return await session.scalar(
+        select(OutboundEmail)
+        .where(OutboundEmail.case_id == case.id)
+        .order_by(OutboundEmail.version.desc())
+        .limit(1)
     )
 
 
@@ -99,6 +116,7 @@ async def create_version(
         signature_name=signature_name,
         content_hash=content_hash(to_address, subject, body),
         created_by_event_id=event_id,
+        rfc822_message_id=new_message_id(),
     )
     session.add(email)
     await session.flush()
@@ -182,6 +200,102 @@ async def discard_live(
         status=to_status.value,
     )
     return email
+
+
+# --- Sending (PLAN D2, D14) ------------------------------------------------------------
+
+
+async def get_email(
+    session: AsyncSession, email_id: uuid.UUID, *, user_id: uuid.UUID
+) -> OutboundEmail:
+    """Load an email owned by `user_id`, fresh from the database."""
+    email = await session.scalar(
+        select(OutboundEmail)
+        .where(OutboundEmail.id == email_id, OutboundEmail.user_id == user_id)
+        .execution_options(populate_existing=True)
+    )
+    if email is None:
+        raise UnknownEmailError(email_id)
+    return email
+
+
+async def claim_for_sending(session: AsyncSession, email_id: uuid.UUID, *, now: datetime) -> bool:
+    """`approved -> sending`: the claim that must commit before Gmail is called (D14).
+
+    False if the email isn't approved any more (sent, cancelled, or claimed by
+    another attempt): then nothing may be sent.
+    """
+    result = await session.execute(
+        update(OutboundEmail)
+        .where(OutboundEmail.id == email_id, OutboundEmail.status == S.APPROVED)
+        .values(status=S.SENDING, updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    claimed = rowcount(result) == 1
+    log.info("email_send_claim", outbound_email_id=str(email_id), claimed=claimed)
+    return claimed
+
+
+async def mark_sent(
+    session: AsyncSession,
+    email: OutboundEmail,
+    *,
+    gmail_message_id: str,
+    gmail_thread_id: str,
+    now: datetime,
+) -> bool:
+    """`sending -> sent`, recording Gmail's ids."""
+    return await _record(
+        session,
+        email,
+        S.SENDING,
+        S.SENT,
+        now=now,
+        gmail_message_id=gmail_message_id,
+        gmail_thread_id=gmail_thread_id,
+        sent_at=now,
+    )
+
+
+async def mark_failed(
+    session: AsyncSession, email: OutboundEmail, *, from_status: OutboundEmailStatus, now: datetime
+) -> bool:
+    """`approved | sending | needs_attention -> failed`: certainly not sent."""
+    if from_status not in (S.APPROVED, S.SENDING, S.NEEDS_ATTENTION):
+        raise ValueError(f"an email can't fail from {from_status.value}")
+    return await _record(session, email, from_status, S.FAILED, now=now)
+
+
+async def mark_needs_attention(
+    session: AsyncSession, email: OutboundEmail, *, now: datetime
+) -> bool:
+    """`sending -> needs_attention`: whether Gmail got it is unknown. Never re-sent."""
+    return await _record(session, email, S.SENDING, S.NEEDS_ATTENTION, now=now)
+
+
+async def confirm_sent(session: AsyncSession, email: OutboundEmail, *, now: datetime) -> bool:
+    """`needs_attention -> sent`: the user found it in Gmail. Gmail's ids stay unknown."""
+    return await _record(session, email, S.NEEDS_ATTENTION, S.SENT, now=now, sent_at=now)
+
+
+async def _record(
+    session: AsyncSession,
+    email: OutboundEmail,
+    from_status: OutboundEmailStatus,
+    to_status: OutboundEmailStatus,
+    *,
+    now: datetime,
+    **values: Any,
+) -> bool:
+    moved = await _move(session, email, from_status, to_status, updated_at=now, **values)
+    log.info(
+        "email_send_status",
+        outbound_email_id=str(email.id),
+        case_id=str(email.case_id),
+        to_status=to_status.value,
+        moved=moved,
+    )
+    return moved
 
 
 async def _move(

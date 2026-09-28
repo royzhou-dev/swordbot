@@ -398,14 +398,51 @@ def test_placeholders_are_rejected(body: str) -> None:
         _draft(body=body)
 
 
-@pytest.mark.parametrize("closing", ["Thanks,", "Best regards,", "Thank you!", "Sincerely"])
+@pytest.mark.parametrize(
+    "closing",
+    [
+        "Thanks,",
+        "Best regards,",
+        "Thank you!",
+        "Sincerely",
+        "Many thanks,",
+        "Thanks in advance!",
+        "Thank you so much,",
+        "With kind regards,",
+        "Best wishes,",
+        "Yours truly,",
+        "All the best,",
+    ],
+)
 def test_a_sign_off_is_rejected(closing: str) -> None:
     with pytest.raises(ValueError, match="sign-off"):
         _draft(body=f"Hi,\n\nPlease refund me.\n\n{closing}")
 
 
-def test_a_closing_sentence_is_fine() -> None:
-    assert _draft(body="Hi,\n\nPlease refund me. Thank you for your help.").body.endswith("help.")
+@pytest.mark.parametrize(
+    "ending",
+    [
+        "Best regards,\nJane Smith",
+        "Thanks,\nRoy\nCustomer",
+        "Many thanks!\nA. Kim\n555-0100",
+    ],
+)
+def test_a_sign_off_followed_by_a_name_is_rejected(ending: str) -> None:
+    # Code signs the email; a model-written name would be a second, possibly invented, one.
+    with pytest.raises(ValueError, match="sign-off"):
+        _draft(body=f"Hi,\n\nPlease refund me.\n\n{ending}")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "Hi,\n\nPlease refund me. Thank you for your help.",
+        "Hi,\n\nPlease refund me. Thanks!",
+        "Hi,\n\nThank you for your help.",
+    ],
+)
+def test_a_closing_sentence_is_fine(body: str) -> None:
+    assert _draft(body=body).body == body
 
 
 def test_the_subject_is_one_bounded_line() -> None:

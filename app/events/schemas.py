@@ -65,6 +65,14 @@ class DraftEmailPayload(BaseModel):
     case_id: uuid.UUID
 
 
+class SendEmailPayload(BaseModel):
+    """`SEND_EMAIL`: send an approved email version."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outbound_email_id: uuid.UUID
+
+
 @dataclass(frozen=True, slots=True)
 class ClaimedEvent:
     """An immutable snapshot of an event the worker has claimed.

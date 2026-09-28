@@ -39,6 +39,12 @@ class IntakeField(StrEnum):
     SIGNATURE_NAME = "signature_name"
 
 
+# The facts code writes into the email itself: the recipient and the sign-off.
+# Every other fact is stated in the subject and body the model writes, so a
+# change to one of them needs the text rewritten.
+CODE_FILLED: Final = frozenset({IntakeField.SUPPORT_EMAIL, IntakeField.SIGNATURE_NAME})
+
+
 class Requirement(StrEnum):
     """Declaration order is the order in which intake asks."""
 

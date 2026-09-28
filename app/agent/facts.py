@@ -1,11 +1,13 @@
 """Checking and recording the facts a user states in chat (PLAN D12).
 
-Shared by intake and draft review. The checks catch the fabrications that
-would do the most harm in an email (Invariant 1): an order number, address or
-name the user never typed, or an impossible date.
+Shared by intake and draft review. Every fact must quote the user's latest
+message, and the checks catch the fabrications that would do the most harm in
+an email (Invariant 1): an order number, address or name the user never typed,
+or a date the user never gave or that is impossible.
 """
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from datetime import date
 from enum import StrEnum
@@ -29,15 +31,37 @@ _EMAIL = re.compile(
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$"
 )
 
+# Something that says when: a number, a month, a weekday, or a relative day.
+_DATE_WORDS = re.compile(
+    r"\d|\b(?:today|tonight|yesterday|morning|afternoon|evening|night|ago|week|weekend|month"
+    r"|(?:mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun)(?:day)?|wednesday|saturday"
+    r"|jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?"
+    r"|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b",
+    re.IGNORECASE,
+)
+
+# Curly quotes (U+2018/19, U+201C/D) compare as straight ones.
+_QUOTES = str.maketrans({chr(0x2018): "'", chr(0x2019): "'", chr(0x201C): '"', chr(0x201D): '"'})
+
 
 def accept_fact(update: FactUpdate, *, message_text: str, today: date) -> str | date | None:
-    """The value to record for a proposed fact, or None to drop it."""
+    """The value to record for a proposed fact, or None to drop it.
+
+    Every fact must quote the user's latest message. The model can still
+    normalize the value ("money back" -> "refund"), but it can't record a
+    detail the user never mentioned.
+    """
+    if _compact(update.quote) not in _compact(message_text):
+        return None
     value = update.value.strip()
     match update.key:
         case IntakeField.ISSUE_TYPE:
             issue_type = parse_issue_type(value.lower().replace(" ", "_").replace("-", "_"))
             return issue_type.value if issue_type else None
         case IntakeField.ORDER_DATE:
+            # The quote must say when: "my order" is no date, even if the ISO value is valid.
+            if not _DATE_WORDS.search(update.quote):
+                return None
             try:
                 order_date = date.fromisoformat(value)
             except ValueError:
@@ -66,8 +90,9 @@ def accept_fact(update: FactUpdate, *, message_text: str, today: date) -> str | 
 
 
 def _compact(text: str) -> str:
-    """Case-folded, without `#` or whitespace: how typed values are compared."""
-    return "".join(ch for ch in text.casefold() if ch != "#" and not ch.isspace())
+    """Case-folded, without `#` or whitespace, straight quotes: how typed text is compared."""
+    folded = unicodedata.normalize("NFKC", text).casefold().translate(_QUOTES)
+    return "".join(ch for ch in folded if ch != "#" and not ch.isspace())
 
 
 def missing(facts: Mapping[str, CaseFact]) -> list[Requirement]:
