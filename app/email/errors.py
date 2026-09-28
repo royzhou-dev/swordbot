@@ -52,7 +52,8 @@ class GmailPermanentError(GmailError, PermanentEventError):
 
 
 class GmailAuthenticationError(GmailPermanentError):
-    """No refresh token, or Google rejected it (revoked, expired, wrong scope)."""
+    """No refresh token, Google rejected it (revoked, expired, wrong scope), or the
+    account isn't set up for the call (e.g. the Gmail API isn't enabled)."""
 
 
 class GmailRejectedError(GmailPermanentError):

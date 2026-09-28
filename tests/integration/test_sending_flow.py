@@ -41,7 +41,7 @@ from app.tools.send_tools import (
     UNREACHABLE_REPLY,
 )
 from app.users.models import User
-from tests.integration.harness import SENDER, SUBJECT, SUPPORT, Harness
+from tests.integration.harness import SENDER, SUBJECT, SUPPORT, Harness, ask, reply
 
 S = OutboundEmailStatus
 RETRY_LATER = timedelta(hours=1)
@@ -388,3 +388,47 @@ async def test_the_question_buttons_are_bound_to_the_email(
     ).all()
     assert {a.payload["outbound_email_id"] for a in actions} == {str(email_id)}
     assert {a.expected_case_status for a in actions} == {CaseStatus.READY_TO_SEND}
+
+
+# --- After the send: messages while the case waits for support -----------------------
+
+
+async def test_a_question_about_the_sent_case_opens_nothing(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session)
+    await _approve(h)
+    # Even if the model records a fact from the question, a chat reply opens no case.
+    h.llm.script(
+        reply("It went out; their reply will come to your inbox.", merchant_name="DoorDash")
+    )
+
+    await h.say("Any news from DoorDash?")
+
+    case = await h.only_case()
+    assert case.status is CaseStatus.WAITING_FOR_SUPPORT
+    assert case.focused
+    # The model was told about the sent email.
+    context = h.llm.calls[-1].messages[1].content
+    assert 'name="sent_case"' in context
+    assert SUPPORT in context and SUBJECT in context
+    assert h.telegram.sent_texts[-1] == "It went out; their reply will come to your inbox."
+
+
+async def test_a_new_problem_beside_the_sent_case_opens_a_new_case(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session)
+    await _approve(h)
+    sent = await h.only_case()
+    h.llm.script(ask("What went wrong with it?", merchant_name="Uber Eats"))
+
+    await h.say("Now my Uber Eats order is wrong too")
+
+    cases = {c.id: c for c in await h.cases()}
+    assert len(cases) == 2
+    assert cases.pop(sent.id).status is CaseStatus.WAITING_FOR_SUPPORT
+    [new] = cases.values()
+    assert new.status is CaseStatus.GATHERING_CONTEXT
+    assert new.merchant_name == "Uber Eats"
+    assert new.focused

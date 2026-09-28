@@ -2,7 +2,7 @@
 
 A personal customer-support assistant. You describe an order problem to a Telegram bot ("My DoorDash order was missing the fries"). The bot works out the details, drafts an email to the merchant's support team, and sends it from your Gmail only after you press **Send**. When support replies, the bot picks the case back up. It asks you before making any consequential decision, such as accepting store credit instead of a refund.
 
-> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer, the intake conversation, and drafting with **[Send] [Edit] [Cancel]** approval exist. Tell the bot about an order problem, answer its questions, and it shows you the email it would send. The send path is built and tested against a stand-in for Gmail; connecting your real Gmail account (M7 part 2) comes next. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
+> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer, the intake conversation, and drafting with **[Send] [Edit] [Cancel]** approval exist. Tell the bot about an order problem, answer its questions, and it shows you the email it would send. Press Send and it goes out from your Gmail (see [Gmail setup](#gmail-setup)); replies aren't read yet, so they arrive only in your inbox. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
 ## Architecture
 
@@ -97,8 +97,9 @@ With SQLite the worker handles one event at a time, and a long handler holds SQL
 | `TELEGRAM_WEBHOOK_SECRET` | Secret that Telegram echoes back in `X-Telegram-Bot-Api-Secret-Token` |
 | `TELEGRAM_ALLOWED_USER_ID` | The only Telegram user the bot responds to (your numeric id) |
 | `TELEGRAM_API_BASE_URL` | Bot API base URL (default `https://api.telegram.org`) |
-| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REDIRECT_URI` | Gmail OAuth client |
-| `GMAIL_REFRESH_TOKEN` | Produced by the one-time OAuth script (M7) |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Your "Desktop app" OAuth client (see [Gmail setup](#gmail-setup)) |
+| `GOOGLE_REDIRECT_URI` | Loopback address `scripts/gmail_auth.py` listens on during consent (default `http://127.0.0.1:8080/`). Only the script uses it |
+| `GMAIL_REFRESH_TOKEN` | Printed by `scripts/gmail_auth.py`. Without all three Gmail credentials, every send reports "Gmail isn't connected" and nothing goes out |
 | `GMAIL_SENDER_ADDRESS` | Your Gmail address, for the From header (the `gmail.send` scope can't read it). The display name follows each case's signature name. Without it, Gmail fills in From itself |
 
 Secrets are loaded as `SecretStr` and are never logged. Log output also passes through a redaction step (`app/logging.py`).
@@ -163,7 +164,7 @@ Every version is kept in `outbound_emails` with its status (`awaiting_approval`,
 
 ## Sending
 
-After you press **Send**, the email goes out from your Gmail as its own step, and the bot tells you what was sent and to whom. The case then waits for support's reply. **The real Gmail connection is M7 part 2**: until then every send reports "Gmail isn't connected", nothing goes out, and the email is offered again.
+After you press **Send**, the email goes out from your Gmail as its own step, and the bot tells you what was sent and to whom. The case then waits for support's reply. Without Gmail credentials (see [Gmail setup](#gmail-setup)) every send reports "Gmail isn't connected", nothing goes out, and the email is offered again.
 
 A send never happens twice (PLAN D14). Before calling Gmail, the bot commits a claim on the email (`approved → sending`) in its own transaction. After that:
 
@@ -173,9 +174,37 @@ A send never happens twice (PLAN D14). Before calling Gmail, the bot commits a c
 
 If a send gives up before reaching Gmail (say, Gmail was unreachable for half an hour), your next message gets the email offered again. `/cancel` while a send's outcome is unknown cancels the case and warns you the email may already have gone out.
 
-## Gmail OAuth setup
+While a case waits for support, a message about it ("any news?") gets a short status reply and opens nothing. The bot can't read replies until M10, so they arrive only in your Gmail inbox. A different problem starts a new case, which then becomes the one the bot is working on.
 
-_To be written in M7._ Scopes will be `gmail.send` (M7) and `gmail.readonly` (M8+). The OAuth consent screen must be set to **In production**, because in Testing mode refresh tokens expire after 7 days.
+## Gmail setup
+
+The bot sends from your own Gmail account through the Gmail API, with a refresh token you create once. It asks for one scope:
+
+| Scope | Since | What it allows |
+|---|---|---|
+| `https://www.googleapis.com/auth/gmail.send` | M7 | Send email as you. It can't read, search or delete anything in your mailbox |
+
+M8 will add `gmail.readonly` (receipt search, reading replies). You'll have to run the script again then.
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create a project (or pick one), open **APIs & Services → Library**, and enable the **Gmail API**.
+2. Set up the **OAuth consent screen** (Google Auth Platform): user type **External**, any app name, your address as the contact. Google only publishes an app whose **Branding** has a home page URL and a privacy policy URL, with their domain under **Authorized domains**. This repo publishes both from [site/](site/) to GitHub Pages (`.github/workflows/pages.yml`; enable it once under **Settings → Pages → Source: GitHub Actions**): home page `https://royzhou-dev.github.io/swordbot/`, privacy policy `https://royzhou-dev.github.io/swordbot/privacy.html`, authorized domain `royzhou-dev.github.io`. Leave the logo empty, since a logo makes Google require verification. Then, under **Audience**, press **Publish app** so its status is **In production**. This matters: in **Testing**, Google expires refresh tokens after 7 days and sends start failing with "Gmail isn't connected". The app stays unverified, which is fine for personal use. Google shows a "Google hasn't verified this app" warning during consent; continue through **Advanced**.
+3. Under **Credentials**, create an **OAuth client ID** of type **Desktop app**. Put its id and secret in `.env` as `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+4. Run the consent flow and allow sending:
+
+   ```bash
+   uv run python scripts/gmail_auth.py          # opens the browser; --no-browser prints the URL
+   ```
+
+   Sign in with the account the bot should send from. The script listens on `GOOGLE_REDIRECT_URI` (default `http://127.0.0.1:8080/`) for Google's redirect, exchanges the code (with PKCE), and prints `GMAIL_REFRESH_TOKEN=...`. Put that line in `.env`, or in your host's secrets in production. It is as sensitive as a password for sending mail as you.
+5. Set `GMAIL_SENDER_ADDRESS` to the same address, then check the setup. This sends nothing:
+
+   ```bash
+   uv run python scripts/gmail_auth.py --check
+   ```
+
+6. Restart the app. For a first real test, give the bot a second address of your own as the support email.
+
+To disconnect, remove the app at [myaccount.google.com/permissions](https://myaccount.google.com/permissions). Sends then fail as "Gmail isn't connected" and nothing goes out. Tokens are refreshed with plain HTTPS calls to Google's token endpoint (`app/email/gmail_client.py`); access tokens are kept only in memory and never logged.
 
 ## Telegram bot setup
 

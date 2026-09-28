@@ -29,7 +29,7 @@ These were decided up front so that every milestone builds on the same foundatio
 
 ### D2. The outbound email state machine is the send guard
 - Every outbound email is an `outbound_emails` row, one per version. Its status moves `awaiting_approval → approved → sending → sent | failed | needs_attention`. A version still awaiting approval can become `superseded` (replaced by a newer version, or discarded when the case goes back to intake), and an unsent one `cancelled` (decided in M6: there is no separate `draft` status, because a draft is shown for approval as soon as it is saved).
-- An approval is tied to one exact draft through `content_hash`, a sha256 of recipient, subject and body together. Any edit creates a new version that needs new approval.
+- An approval is tied to one exact draft through `content_hash`, a sha256 of recipient, subject and body together (from M8.5, the sending account too). Any edit creates a new version that needs new approval.
 - To send, the code first runs an atomic conditional update (`UPDATE … SET status='sending' WHERE id=? AND status='approved'`). If no rows were updated, it does not send. This is what makes a duplicate button press or webhook harmless (Invariant 5).
 - Each email gets a client-generated RFC 822 `Message-ID` before sending. If the process crashes while an email is `sending`, the email is **never automatically re-sent**. The system checks Gmail Sent for that Message-ID (once the read scope exists, from M8 on). Before that, it marks the email `needs_attention` and asks the user.
 - The `send_support_email` tool refuses to run without a valid approval record. This check lives in code, not in the prompt (Invariant 2).
@@ -41,7 +41,7 @@ These were decided up front so that every milestone builds on the same foundatio
 
 ### D4. Thin HTTP clients, not SDK frameworks
 - **Telegram**: a small `httpx` async client plus Pydantic models for the Update fields we use. This avoids python-telegram-bot or aiogram, which bring their own event loop and dispatcher that would conflict with our event layer.
-- **Gmail**: `google-auth` for OAuth tokens, plus `httpx` calls to the Gmail REST API. `google-api-python-client` is synchronous and heavy.
+- **Gmail**: `httpx` calls to the Gmail REST API and to Google's token endpoint. `google-api-python-client` is synchronous and heavy. (Changed in M7: the plan was `google-auth` for tokens, but its refresh is synchronous and needs `requests` or `aiohttp`, and a refresh-token grant is one form POST. Doing it in `httpx` keeps it async, maps its errors onto the D14 classes directly and tests with `respx`. No Google library is a dependency.)
 - **OpenAI**: the official `openai` SDK, wrapped behind the `LLMClient` protocol. Workflow-driving outputs use structured outputs (Pydantic schemas). Model names come from config.
 - **Tests**: a fake `LLMClient`, fake Telegram, Gmail and web-search clients (protocol implementations), and `respx` for HTTP-level client tests.
 
@@ -52,7 +52,7 @@ These were decided up front so that every milestone builds on the same foundatio
 - Migrations: Alembic, async SQLAlchemy 2.x. Postgres uses `asyncpg`; local development and tests may use SQLite via `aiosqlite`. Use only portable column types: `JSON` (not `JSONB` in the models), `Uuid`, timezone-aware `DateTime`. CI runs the test suite against Postgres too.
 
 ### D6. Gmail OAuth for a single user (v1)
-- A one-time local script, `scripts/gmail_auth.py`, runs the installed-app OAuth flow and prints a refresh token. That token is stored as a secret (`GMAIL_REFRESH_TOKEN`). OAuth tokens are moved into an encrypted DB table only when multi-user support arrives.
+- A one-time local script, `scripts/gmail_auth.py`, runs the installed-app OAuth flow and prints a refresh token. It uses a "Desktop app" client, a loopback redirect (`GOOGLE_REDIRECT_URI`, default `http://127.0.0.1:8080/`), PKCE and a `state` check, built on the standard library and `httpx` (so no `google-auth-oauthlib`). `--check` refreshes a token with the configured credentials and sends nothing. That token is stored as a secret (`GMAIL_REFRESH_TOKEN`). OAuth tokens are moved into an encrypted DB table only when multi-user support arrives. Several Gmail accounts for the one user (M8.5) are still env/host secrets, one refresh token per account.
 - Scopes are added one milestone at a time and documented in the README:
   - M7: `https://www.googleapis.com/auth/gmail.send`
   - M8+: add `gmail.readonly` (search, read, history, watch)
@@ -61,6 +61,7 @@ These were decided up front so that every milestone builds on the same foundatio
 
 ### D7. Routing messages to a case
 - v1 keeps a per-user "focused case". A new complaint while no case is focused creates a case. Replies while a case is in `GATHERING_CONTEXT` or `WAITING_FOR_USER` go to that case.
+- A message while the focused case is `WAITING_FOR_SUPPORT` (decided in M7) goes to intake with no case, as a possible new problem, but the intake model also gets a `sent_case` data block (merchant, recipient, subject, date sent, and a status note that replies aren't tracked yet). A question about the sent case gets a status reply. Code enforces that a `reply_to_user` there never opens a case, even if the model recorded facts, so "any news from DoorDash?" can't start a duplicate. A new problem opens a new case, which takes the focus; the sent case keeps waiting and is matched by thread id from M10. M10 replaces the status note.
 - Once there are several active cases (M13), an LLM classifier returns `{case_id | new_case | ambiguous}`. If the result is ambiguous, the bot asks with buttons. It never guesses when a decision is being applied.
 
 ### D8. Case facts, provenance, and optimistic locking (decided in M1)
@@ -166,9 +167,9 @@ Additional rules:
 | `case_messages` | M5 | Chat log for LLM context (last 20 per turn). Not workflow state. |
 | `events` | M2 | Inbox and job queue (D1, D9): type, source, external_id, payload, status, attempts, run_at, lease |
 | `pending_actions` | M3 | Button actions (D3) |
-| `outbound_emails` | M6 | Drafts, approvals and sends (D2, D13, D14): one row per version; M7 adds the Message-ID and Gmail's ids |
-| `email_messages` | M10 | Inbound emails being tracked: unique `gmail_message_id`, thread, case, classification |
-| `gmail_sync_state` | M10 | `history_id` and watch expiration per user |
+| `outbound_emails` | M6 | Drafts, approvals and sends (D2, D13, D14): one row per version; M7 adds the Message-ID and Gmail's ids; M8.5 adds `from_address` |
+| `email_messages` | M10 | Inbound emails being tracked: unique `(account, gmail_message_id)`, thread, case, classification |
+| `gmail_sync_state` | M10 | `history_id` and watch expiration per Gmail account (M8.5) |
 
 ---
 
@@ -243,7 +244,12 @@ Additional rules:
   - `tools/send_tools.py`: `send_support_email` (REQUIRES_APPROVAL), `offer_again`, `ask_if_sent`. `email/sending.py`: `EmailSender` (the `SEND_EMAIL` handler), `resume_unfinished_send`, `confirm_sent` / `confirm_not_sent`.
   - `chat/handlers.py`: the Send press queues `SEND_EMAIL`; `ActionKind.CONFIRM_SENT` / `CONFIRM_NOT_SENT`; a message while `READY_TO_SEND` settles an unfinished send; `/cancel` handles an email still `sending`. New setting `GMAIL_SENDER_ADDRESS`.
   - Tests: `tests/integration/test_sending_flow.py` (SQLite and Postgres), with `FakeGmailClient`.
-- **Part 2 (next):** the real `HttpGmailClient` (`google-auth` token refresh, `users.messages.send`, mapping errors to the D14 classes), `scripts/gmail_auth.py`, the README's Gmail setup and scope, and the manual send. Also decide routing for messages about a case that is `WAITING_FOR_SUPPORT` (today they go to intake with no case).
+- **Part 2 (built; the manual send is still to do):**
+  - `email/gmail_client.py`: `HttpGmailClient` (refresh-token grant and `users.messages.send` over `httpx`, see D4) and `build_gmail_client`, which the lifespan uses; with any credential missing or blank it falls back to `UnconfiguredGmailClient`. The access token lives in memory only, is refreshed 5 minutes before expiry under a lock, and is dropped on a 401. A refreshed token without the `gmail.send` scope is refused.
+  - Error mapping (D14). Token endpoint: 4xx → `GmailAuthenticationError`; 5xx, 429 or a timeout → `GmailTemporaryError` (retried before the claim); no connection → `GmailUnreachableError`. Send: no connection (`ConnectError`, `ConnectTimeout`, `PoolTimeout`), or a token failure inside `send` → `GmailUnreachableError` (nothing sent); 401, or a 403 about setup (`insufficientPermissions`, `accessNotConfigured`) → `GmailAuthenticationError`; any other 4xx, 429 included → `GmailRejectedError`; 5xx, a read timeout, a dropped connection, or a 2xx without Gmail's ids → `GmailTemporaryError` (outcome unknown, so `needs_attention`). Errors carry the call, the HTTP status and Google's short error code, never the message text, a token or an address.
+  - `scripts/gmail_auth.py` (D6). Routing for a `WAITING_FOR_SUPPORT` case (D7): `Route.sent`, `SentCase` and the `sent_case` block in `agent/prompts.py`, and the guard in `agent/intake.py`.
+  - Tests: `tests/unit/test_gmail_client.py` (respx), `tests/integration/test_gmail_send.py` (the real client on mocked HTTP through the Send flow), and the sent-case routing tests in `test_sending_flow.py`.
+  - **To finish M7:** set up Gmail (README, "Gmail setup") and send a real email to your own second address from a real Telegram chat.
 
 ### M7.5. First deployment
 - Pick a platform (see Open Decisions), set up a managed Postgres, set the Telegram webhook with a secret, and run migrations as a release step.
@@ -254,10 +260,35 @@ Additional rules:
 ## Phase 2 — Context gathering and inbound email
 
 ### M8. Gmail receipt search
-- Add the `gmail.readonly` scope. Tools: `search_order_emails(merchant, approximate_date, order_number?)` returns `OrderEmailCandidate`s, and `read_email(message_id)`.
+- Add the `gmail.readonly` scope. Update the privacy policy linked from the OAuth app's Branding page (`site/privacy.html`, published by `.github/workflows/pages.yml`) to cover reading receipts **before** requesting the scope. Tools: `search_order_emails(merchant, approximate_date, order_number?)` returns `OrderEmailCandidate`s, and `read_email(message_id)`.
 - Receipts are parsed in code first (HTML to text, then trimmed). Only the trimmed receipt text goes to `extract_structured` to produce `ReceiptInfo` (order number, date, total, items, and any support contact).
 - Before any fact from a receipt is used, the bot asks "I found order #… for $… — is this it? [Yes] [No]". Provenance = `gmail_receipt`.
 - **Verify:** fixture emails (DoorDash, Amazon, generic) extract correctly. The LLM only ever receives the minimal content.
+- Build the search against one `GmailClient` passed in as a parameter (not a global), so M8.5 can run it once per account.
+
+### M8.5. Multiple Gmail accounts
+The user shops from more than one Gmail account. Support finds an order by the address it was placed with, so each case must send from, search in, and follow the replies of the right account. Until this milestone, everything uses the one account from M7. Gmail and Google Workspace accounts only: other providers (Outlook, iCloud, ...) would each need their own adapter and are not planned.
+
+- **Accounts.** All accounts share the one OAuth client, and each gets its own refresh token from `scripts/gmail_auth.py`, run once per account. The script also requests the `openid email` scopes, so it can show which account actually consented and refuse a token for an unexpected address. The tokens stay in env/host secrets as `GMAIL_ACCOUNTS`, a list of `{address, refresh_token}` with one marked default. D6's encrypted table is for multiple *users*; this is still one user. The M7 variables (`GMAIL_REFRESH_TOKEN`, `GMAIL_SENDER_ADDRESS`) keep working as a one-account list. `--check` checks every account.
+- **Clients.** `build_gmail_clients` returns one `HttpGmailClient` per address (`GmailAccounts`: lookup by address, plus the default). An account with bad credentials is reported per account and doesn't stop the others.
+- **Which account a case uses.** It is a case fact, `gmail_account`, and it must be one of the configured addresses:
+  1. One account configured: that account, with no question.
+  2. Otherwise, **search all accounts** for the order (M8's search, run concurrently, one call per account). The M8 confirmation names the account ("I found order #… for $… in you@work.com. Is this it? [Yes] [No]"). A confirmed receipt sets the account, with provenance `gmail_receipt`.
+  3. If the order turns up in no account, in more than one, or the user says No to every candidate: **ask with buttons**, one per configured account, default first. Never free text. If the user names the account in a message ("it was on my work email"), it is recorded only if it matches a configured address; anything else gets the buttons.
+  4. The account is a requirement before drafting, like `support_email` (D12).
+  - A mailbox that can't be searched (revoked token, outage) is skipped. The user is told which one, and the account can still be picked with the buttons.
+- **Approval covers the From address.** `content_hash` adds the sending address, and the draft preview shows `From:` next to `To:`. Changing the account is a code-filled change (D13): a new version and a new Send press, so a draft approved for one account never goes out from another. `outbound_emails.from_address` stores it. A migration adds the column, filling in the default account, and drafts awaiting approval at upgrade are re-issued as new versions, since their stored hash no longer matches.
+- **Sending.** `EmailSender` uses the client for `email.from_address`, never silently the default. From = that address, with the case's signature name. Messages name the account ("Gmail isn't connected for you@work.com"; "check the Sent folder of you@work.com").
+- **Threads.** Gmail thread and message ids are only unique within one mailbox. `support_cases` gets `gmail_account` alongside `gmail_thread_id`, and everything that matches on them (M10) matches on the pair.
+- **Verify:** tests show that
+  - an order found only in the second account sets the account, and the email goes out through that account's client;
+  - no match, or matches in two accounts, asks with buttons;
+  - a text answer naming an unknown address isn't recorded;
+  - switching the account invalidates the old Send button;
+  - one revoked account doesn't stop the search, and the user is told;
+  - the M7 single-account variables still work.
+
+  Manual check: a real send from a second account, and `gmail_auth.py --check` with two accounts.
 
 ### M9. Support contact discovery
 - `web/search.py` defines a `WebSearchClient` protocol and one provider (see Open Decisions). `web/support_discovery.py` applies the priority order: receipt, then official domain, then official help center, then search results on official domains, then a fallback.
@@ -265,9 +296,9 @@ Additional rules:
 - **Verify:** unit tests with canned search results check that a third-party page's address is ranked below the official domain.
 
 ### M10. Inbound email tracking
-- `api/gmail.py` is a Pub/Sub push endpoint that verifies the Google OIDC JWT. It runs `history.list` from the stored `history_id` and turns each new message into an `EMAIL_RECEIVED` event (deduped on `gmail_message_id`).
-- A `users.watch` renewal is scheduled as a recurring event every 6 days (watches expire after 7). There is also a local-dev polling fallback.
-- `email/threading.py` matches by thread id first, then falls back to In-Reply-To/References. Messages sent by the user are ignored.
+- `api/gmail.py` is a Pub/Sub push endpoint that verifies the Google OIDC JWT. It runs `history.list` from the stored `history_id` and turns each new message into an `EMAIL_RECEIVED` event (deduped on `(account, gmail_message_id)`).
+- A `users.watch` renewal is scheduled as a recurring event every 6 days (watches expire after 7). There is also a local-dev polling fallback. Watches, `history_id` and renewals are **per account** (M8.5): the push notification names the mailbox, and each account has its own sync state.
+- `email/threading.py` matches by `(account, thread id)` first, then falls back to In-Reply-To/References. Messages sent by the user, from any configured account, are ignored.
 - The handler summarizes the reply (untrusted content), notifies the user, and moves the case to `WAITING_FOR_USER`.
 - **Verify:** a fake Gmail sequence of reply, duplicate notification, and unrelated email gives one notification for the correct case.
 

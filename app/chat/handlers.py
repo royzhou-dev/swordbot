@@ -96,6 +96,7 @@ class UserMessageHandler:
                     outbox,
                     text,
                     case=route.case,
+                    sent_case=route.sent,
                     telegram_message_id=payload.telegram_message_id,
                 )
             case Stage.DRAFT_REVIEW:

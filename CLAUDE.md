@@ -20,9 +20,9 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 | M4 | `LLMClient` abstraction (OpenAI + fake) | done |
 | M5 | Tool registry with risk levels + agent runtime + intake conversation | done |
 | M6 | Email drafting + Send/Edit/Cancel approval | done |
-| M7 | Gmail send + thread id stored → `WAITING_FOR_SUPPORT` (**Phase 1 done**) | in progress: send path done against a fake Gmail (part 1); real Gmail client + OAuth next |
+| M7 | Gmail send + thread id stored → `WAITING_FOR_SUPPORT` (**Phase 1 done**) | in progress: send path (part 1) and real Gmail client + OAuth script (part 2) built; a manual real send remains |
 | M7.5 | First cloud deployment | not started |
-| M8–M10 | Phase 2: receipt search, support-contact discovery, inbound email via Pub/Sub | not started |
+| M8–M10 | Phase 2: receipt search, multiple Gmail accounts (M8.5), support-contact discovery, inbound email via Pub/Sub | not started |
 | M11–M12 | Phase 3: reply classification, approval policy engine, routine auto-replies | not started |
 | M13–M15 | Phase 4: multi-case routing + `/cases`, follow-ups, resolution tracking | not started |
 
@@ -53,7 +53,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 
 ## Stack & conventions
 
-- Python **3.12+**, managed by **uv**. Development uses 3.14 (`py -3.14`, pinned in `.python-version`). `uv` is on the user PATH (installed in `C:\Users\royzh\AppData\Roaming\Python\Python314\Scripts`). If a shell that started before the PATH change can't find it (PowerShell sessions often can't), call `uv` by its full path. Plain `python` in Git Bash is 2.7; use `uv run` or `py -3.14` instead. Docker Desktop provides the local Postgres (`docker compose up -d db`). FastAPI, Pydantic v2, pydantic-settings, SQLAlchemy 2.x async, Alembic, httpx, structlog, openai SDK, google-auth.
+- Python **3.12+**, managed by **uv**. Development uses 3.14 (`py -3.14`, pinned in `.python-version`). `uv` is on the user PATH (installed in `C:\Users\royzh\AppData\Roaming\Python\Python314\Scripts`). If a shell that started before the PATH change can't find it (PowerShell sessions often can't), call `uv` by its full path. Plain `python` in Git Bash is 2.7; use `uv run` or `py -3.14` instead. Docker Desktop provides the local Postgres (`docker compose up -d db`). FastAPI, Pydantic v2, pydantic-settings, SQLAlchemy 2.x async, Alembic, httpx, structlog, openai SDK. Google OAuth is plain `httpx` too (PLAN D4); no Google library.
 - Postgres in production (`asyncpg`); SQLite (`aiosqlite`) is allowed for local development and tests. Use only portable types: `JSON`, `Uuid`, tz-aware `DateTime`. No Postgres-only features in the models. The exceptions are `SKIP LOCKED` and `ON CONFLICT DO NOTHING`, both isolated in `app/events/service.py` (SQLite ignores the first and supports the second).
 - Telegram and Gmail use thin `httpx` clients (no python-telegram-bot or google-api-python-client). See PLAN D4 before adding any dependency.
 - All schema changes go through Alembic migrations. Never call `create_all` at startup.
@@ -62,7 +62,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 
 ## Commands
 
-Keep this section accurate as milestones land. `gmail_auth.py` arrives with M7.
+Keep this section accurate as milestones land.
 
 ```bash
 uv sync                                  # install deps
@@ -78,6 +78,7 @@ uv run python scripts/llm_smoke.py       # one real ExtractedIssue call to check
 uv run python scripts/llm_smoke.py --intake   # one real IntakeDecision call (checks the agent schema)
 uv run python scripts/llm_smoke.py --draft    # one real draft for a sample case (checks DraftSupportEmail)
 uv run python scripts/gmail_auth.py      # one-time Gmail OAuth → refresh token
+uv run python scripts/gmail_auth.py --check   # check the configured Gmail credentials (sends nothing)
 ```
 
 ## Security & logging

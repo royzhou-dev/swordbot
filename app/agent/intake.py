@@ -3,7 +3,9 @@
 One user message is one agent turn (PLAN D12). The model returns the facts in
 the message and a proposed action. Code then:
 
-1. opens a case if there is none and the message describes a problem;
+1. opens a case if there is none and the message describes a problem (but
+   never for a chat reply while the focused case's email is with support:
+   that message is about the sent case);
 2. validates each fact and records it with provenance (`user_message`);
 3. works out from the recorded facts what is still missing (`policies`);
 4. chooses what happens: the model's question, a fallback question when the
@@ -22,13 +24,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.drafting import request_draft
 from app.agent.facts import Recorded, accept_fact, missing, record_fact
 from app.agent.policies import FALLBACK_QUESTIONS, IntakeField
-from app.agent.prompts import intake_context, intake_messages
+from app.agent.prompts import SentCase, intake_context, intake_messages
 from app.agent.runtime import TurnOutcome, TurnResult, run_turn
 from app.agent.schemas import FinishIntake, IntakeDecision
 from app.cases import messages as case_messages
 from app.cases import service as case_service
 from app.cases.models import CaseStatus, MessageRole, SupportCase, TransitionActor
 from app.cases.state_machine import transition
+from app.email import drafts
+from app.email.models import OutboundEmailStatus
 from app.events.handlers import HandlerContext
 from app.llm.client import LLMClient
 from app.telegram.delivery import TelegramOutbox
@@ -66,8 +70,12 @@ class IntakeAgent:
         *,
         case: SupportCase | None,
         telegram_message_id: int | None,
+        sent_case: SupportCase | None = None,
     ) -> None:
-        """One intake turn. `case` is the routed intake case, or None to maybe open one."""
+        """One intake turn. `case` is the routed intake case, or None to maybe open one.
+
+        `sent_case`, with no `case`: the focused case whose email went out.
+        """
         session = ctx.session
         today = ctx.now.astimezone(self._timezone).date()
         facts = await case_service.get_current_facts(session, case) if case else {}
@@ -80,6 +88,7 @@ class IntakeAgent:
             has_case=case is not None,
             facts=facts,
             missing=missing(facts),
+            sent=await self._sent_summary(session, sent_case) if case is None else None,
         )
         tools = ToolContext(
             session=session,
@@ -96,6 +105,7 @@ class IntakeAgent:
             text=text,
             telegram_message_id=telegram_message_id,
             today=today,
+            beside_sent_case=case is None and sent_case is not None,
         )
         if case is not None:
             await turn.record_user_message(case)
@@ -118,6 +128,21 @@ class IntakeAgent:
         if opened is not None and opened.status is CaseStatus.READY_TO_DRAFT:
             await request_draft(session, opened, cause_event_id=ctx.event.id, now=ctx.now)
 
+    async def _sent_summary(
+        self, session: AsyncSession, case: SupportCase | None
+    ) -> SentCase | None:
+        if case is None:
+            return None
+        email = await drafts.latest_version(session, case)
+        if email is None or email.status is not OutboundEmailStatus.SENT:
+            return None
+        return SentCase(
+            merchant=case.merchant_name,
+            to_address=email.to_address,
+            subject=email.subject,
+            sent_on=email.sent_at.astimezone(self._timezone).date() if email.sent_at else None,
+        )
+
 
 @dataclass
 class _IntakeTurn:
@@ -129,6 +154,8 @@ class _IntakeTurn:
     text: str
     telegram_message_id: int | None
     today: date
+    # No case is routed, but the focused case's email is with support.
+    beside_sent_case: bool = False
     facts_changed: bool = False
 
     @property
@@ -159,6 +186,12 @@ class _IntakeTurn:
                 accepted.append((update.key, value))
 
         case = self.tools.case
+        if case is None and self.beside_sent_case and isinstance(action, ReplyToUser):
+            # A chat reply is about the sent case, whatever facts came with it:
+            # opening a case here would start a duplicate of it.
+            if accepted:
+                self.tools.log.info("intake_facts_ignored_beside_sent_case", count=len(accepted))
+            return action
         if case is None:
             # Small talk opens no case.
             if not accepted and not isinstance(action, AskUser):

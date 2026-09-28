@@ -16,6 +16,7 @@ from app.actions.models import PendingAction
 from app.cases import service as case_service
 from app.cases.models import CaseFact, SupportCase
 from app.db.session import Database
+from app.email.gmail_client import GmailClient
 from app.email.models import OutboundEmail
 from app.events.routing import build_registry
 from app.events.service import EventPolicy
@@ -104,7 +105,12 @@ SENDER = "me@example.com"
 
 class Harness:
     def __init__(
-        self, database: Database, session: AsyncSession, *, policy: EventPolicy | None = None
+        self,
+        database: Database,
+        session: AsyncSession,
+        *,
+        policy: EventPolicy | None = None,
+        gmail: GmailClient | None = None,
     ) -> None:
         self.database = database
         self.session = session
@@ -117,7 +123,8 @@ class Harness:
             build_registry(
                 self.telegram,
                 self.llm,
-                gmail=self.gmail,
+                # `gmail` replaces the fake, e.g. with the real client on mocked HTTP.
+                gmail=gmail or self.gmail,
                 database=database,
                 user_timezone=ZoneInfo("UTC"),
                 sender_address=SENDER,

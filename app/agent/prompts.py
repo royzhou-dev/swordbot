@@ -47,6 +47,10 @@ something already known. Don't ask for several things at once.
    - reply_to_user: the message is not about an order problem (a greeting, thanks, \
 something unrelated) or asks you a question. Keep it brief. If there is no open case, \
 mention that you help with problems with online orders.
+   If the context has a sent_case block, the user's email about that problem already \
+went to support. When the latest message asks about that case or adds to it, use \
+reply_to_user, record no facts, and answer from sent_case. Only a different problem \
+starts a new case.
 3. reason: one short sentence, for debugging.
 
 Write like a helpful person in a chat: short and plain, no bullet points, no promises \
@@ -118,6 +122,23 @@ def render_data_block(name: str, content: str) -> str:
     return f'<data name="{name}">\n{safe}\n</data>'
 
 
+# What the model may tell the user about a sent case. M10 changes it, once replies are read.
+SENT_CASE_STATUS = (
+    "The email went out and the case is waiting for support's reply. Replies aren't "
+    "tracked yet: they arrive in the user's Gmail inbox."
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SentCase:
+    """The focused case whose email went to support, as the intake model sees it."""
+
+    merchant: str | None
+    to_address: str
+    subject: str
+    sent_on: date | None
+
+
 def intake_context(
     *,
     today: date,
@@ -125,6 +146,7 @@ def intake_context(
     has_case: bool,
     facts: Mapping[str, CaseFact],
     missing: Sequence[Requirement],
+    sent: SentCase | None = None,
 ) -> str:
     if has_case:
         still_missing = {r.value: DESCRIPTIONS[r] for r in missing}
@@ -133,15 +155,23 @@ def intake_context(
             "note": "No case is open. If the user describes an order problem, a case is "
             "opened with the facts you record."
         }
-    return "\n\n".join(
-        [
-            render_data_block("today", f"{today.isoformat()} ({timezone})"),
-            render_data_block("known_facts", _facts_json(facts)),
-            render_data_block(
-                "still_missing", json.dumps(still_missing, ensure_ascii=False, indent=1)
-            ),
-        ]
-    )
+    blocks = [
+        render_data_block("today", f"{today.isoformat()} ({timezone})"),
+        render_data_block("known_facts", _facts_json(facts)),
+        render_data_block("still_missing", json.dumps(still_missing, ensure_ascii=False, indent=1)),
+    ]
+    if sent is not None:
+        summary = {
+            "merchant": sent.merchant,
+            "sent_to": sent.to_address,
+            "subject": sent.subject,
+            "sent_on": sent.sent_on.isoformat() if sent.sent_on else None,
+            "status": SENT_CASE_STATUS,
+        }
+        blocks.append(
+            render_data_block("sent_case", json.dumps(summary, ensure_ascii=False, indent=1))
+        )
+    return "\n\n".join(blocks)
 
 
 def intake_messages(*, context: str, history: Sequence[CaseMessage], latest: str) -> list[Message]:
