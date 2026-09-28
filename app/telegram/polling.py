@@ -3,6 +3,10 @@
 Updates go through `ingest_update`, exactly like the webhook. The offset only
 advances after an update is stored, so a crash or database error means
 Telegram delivers it again, and deduplication drops it if it was stored.
+
+Polling and a webhook are exclusive. If the bot has a webhook (the deployed app
+uses one), polling refuses to start unless told to take over, because removing
+the webhook silently diverts the production bot's messages to this database.
 """
 
 import asyncio
@@ -20,6 +24,15 @@ log = get_logger(__name__)
 
 LONG_POLL_SECONDS = 30
 _ERROR_BACKOFF_SECONDS = 5.0
+
+
+class WebhookActiveError(Exception):
+    """The bot has a webhook, so polling would take its updates away from the deployment."""
+
+    def __init__(self, url: str) -> None:
+        # The URL is the deployment's public address; it contains no secret.
+        super().__init__(f"a webhook is set for this bot: {url}")
+        self.url = url
 
 
 async def poll_once(
@@ -45,13 +58,24 @@ async def poll_once(
 
 
 async def run_polling(
-    client: TelegramClient, database: Database, *, allowed_user_id: int | None
+    client: TelegramClient,
+    database: Database,
+    *,
+    allowed_user_id: int | None,
+    take_over: bool = False,
 ) -> None:
     """Poll until cancelled. Temporary Telegram or database errors back off and retry;
     a bad token (`TelegramAuthenticationError`) propagates.
+
+    Raises `WebhookActiveError` if a webhook is set, unless `take_over` is true.
     """
-    # getUpdates is refused while a webhook is set. Pending updates are kept.
-    await client.delete_webhook(drop_pending_updates=False)
+    webhook = await client.get_webhook_info()
+    if webhook.url:
+        if not take_over:
+            raise WebhookActiveError(webhook.url)
+        log.warning("telegram_webhook_removed_for_polling")
+        # getUpdates is refused while a webhook is set. Pending updates are kept.
+        await client.delete_webhook(drop_pending_updates=False)
     offset: int | None = None
     while True:
         try:

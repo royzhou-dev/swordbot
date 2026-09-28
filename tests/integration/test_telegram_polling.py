@@ -8,7 +8,7 @@ from app.db.session import Database
 from app.events.models import Event
 from app.telegram.errors import TelegramAuthenticationError
 from app.telegram.ingest import ALLOWED_UPDATES
-from app.telegram.polling import poll_once, run_polling
+from app.telegram.polling import WebhookActiveError, poll_once, run_polling
 from tests.fakes import FakeTelegramClient, message_update
 
 OWNER = 1_000_000_001
@@ -57,14 +57,35 @@ async def test_empty_poll_keeps_the_offset(database: Database) -> None:
     assert offset == 7
 
 
-async def test_polling_removes_the_webhook_first_and_stops_on_a_bad_token(
-    database: Database,
-) -> None:
+async def test_polling_stops_on_a_bad_token(database: Database) -> None:
     telegram = FakeTelegramClient()
     telegram.fail("get_updates", TelegramAuthenticationError("401"))
 
     with pytest.raises(TelegramAuthenticationError):
         await run_polling(telegram, database, allowed_user_id=OWNER)
 
-    assert telegram.calls[0].method == "delete_webhook"
-    assert telegram.calls[0].args == {"drop_pending_updates": False}
+    assert [c.method for c in telegram.calls] == ["get_webhook_info"]
+
+
+async def test_polling_refuses_to_remove_a_webhook(database: Database) -> None:
+    # The deployed app's webhook: polling would divert its messages to this database.
+    telegram = FakeTelegramClient()
+    telegram.webhook_url = "https://swordbot.example/telegram/webhook"
+
+    with pytest.raises(WebhookActiveError):
+        await run_polling(telegram, database, allowed_user_id=OWNER)
+
+    assert telegram.calls_to("delete_webhook") == []
+    assert telegram.calls_to("get_updates") == []
+
+
+async def test_polling_takes_over_a_webhook_when_told_to(database: Database) -> None:
+    telegram = FakeTelegramClient()
+    telegram.webhook_url = "https://swordbot.example/telegram/webhook"
+    telegram.fail("get_updates", TelegramAuthenticationError("401"))
+
+    with pytest.raises(TelegramAuthenticationError):
+        await run_polling(telegram, database, allowed_user_id=OWNER, take_over=True)
+
+    # Pending updates are kept, so nothing sent meanwhile is lost.
+    assert telegram.calls_to("delete_webhook") == [{"drop_pending_updates": False}]

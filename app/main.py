@@ -5,7 +5,7 @@ import httpx
 from fastapi import FastAPI
 
 from app.api import health, telegram
-from app.config import Settings, get_settings
+from app.config import ConfigurationError, Settings, check_production_config, get_settings
 from app.db.session import Database
 from app.email.gmail_client import build_gmail_client
 from app.events.routing import build_registry
@@ -23,6 +23,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configure_logging(settings.log_level, json_output=settings.is_production)
+        try:
+            check_production_config(settings)
+        except ConfigurationError as exc:
+            # The message names the settings only, never their values.
+            get_logger(__name__).error("startup_config_invalid", error=str(exc))
+            raise
         # The engine connects lazily. The schema is managed by Alembic, never created here.
         database = Database.from_url(settings.database_url)
         app.state.settings = settings
@@ -64,7 +70,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             if worker is not None:
-                await worker.stop()
+                await worker.stop(grace=settings.worker_shutdown_grace_seconds)
             await llm.aclose()
             await gmail.aclose()
             await http.aclose()

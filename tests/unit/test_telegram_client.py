@@ -139,3 +139,55 @@ async def test_network_error_is_temporary_and_hides_the_url(
 async def test_unconfigured_client_fails_permanently() -> None:
     with pytest.raises(TelegramAuthenticationError):
         await UnconfiguredTelegramClient().send_message(1, "hi")
+
+
+async def test_set_webhook_sends_the_secret_and_allowed_updates(
+    client: HttpTelegramClient, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.post(_url("setWebhook")).mock(return_value=_ok(True))
+
+    await client.set_webhook(
+        "https://swordbot.example/telegram/webhook",
+        secret_token=SecretStr("webhook-secret"),
+        allowed_updates=["message", "callback_query"],
+    )
+
+    body = json.loads(route.calls.last.request.content)
+    assert body == {
+        "url": "https://swordbot.example/telegram/webhook",
+        "secret_token": "webhook-secret",
+        "allowed_updates": ["message", "callback_query"],
+        "drop_pending_updates": False,
+    }
+
+
+async def test_get_webhook_info_parses_the_result(
+    client: HttpTelegramClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.post(_url("getWebhookInfo")).mock(
+        return_value=_ok(
+            {
+                "url": "https://swordbot.example/telegram/webhook",
+                "has_custom_certificate": False,
+                "pending_update_count": 2,
+                "last_error_date": 1_700_000_000,
+                "last_error_message": "Wrong response from the webhook: 401 Unauthorized",
+            }
+        )
+    )
+
+    info = await client.get_webhook_info()
+
+    assert info.url == "https://swordbot.example/telegram/webhook"
+    assert info.pending_update_count == 2
+    assert info.last_error_message is not None
+
+
+async def test_get_webhook_info_without_a_webhook(
+    client: HttpTelegramClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.post(_url("getWebhookInfo")).mock(
+        return_value=_ok({"url": "", "has_custom_certificate": False, "pending_update_count": 0})
+    )
+
+    assert (await client.get_webhook_info()).url == ""

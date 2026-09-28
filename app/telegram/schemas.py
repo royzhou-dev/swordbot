@@ -57,3 +57,13 @@ class TelegramUpdate(_TelegramModel):
 class SentMessage(_TelegramModel):
     message_id: int
     chat: TelegramChat
+
+
+class WebhookInfo(_TelegramModel):
+    # Empty when no webhook is set (polling mode).
+    url: str = ""
+    pending_update_count: int = 0
+    # Unix time and Telegram's description of the last failed delivery, if any.
+    last_error_date: int | None = None
+    last_error_message: str | None = None
+    allowed_updates: list[str] | None = None

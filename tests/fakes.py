@@ -20,7 +20,7 @@ from app.llm.errors import InvalidAgentDecisionError
 from app.logging import get_logger
 from app.telegram.client import ReplyMarkup
 from app.telegram.delivery import TelegramOutbox
-from app.telegram.schemas import SentMessage, TelegramChat, TelegramUser
+from app.telegram.schemas import SentMessage, TelegramChat, TelegramUser, WebhookInfo
 from app.tools.registry import ToolContext
 
 
@@ -37,6 +37,8 @@ class FakeTelegramClient:
         self.calls: list[TelegramCall] = []
         # Batches returned by successive get_updates calls.
         self.update_batches: list[list[dict[str, Any]]] = []
+        # What get_webhook_info reports ("" = no webhook set).
+        self.webhook_url = ""
         self._failures: defaultdict[str, list[Exception]] = defaultdict(list)
         self._next_message_id = 500
 
@@ -96,6 +98,11 @@ class FakeTelegramClient:
 
     async def delete_webhook(self, *, drop_pending_updates: bool = False) -> None:
         self._record("delete_webhook", drop_pending_updates=drop_pending_updates)
+        self.webhook_url = ""
+
+    async def get_webhook_info(self) -> WebhookInfo:
+        self._record("get_webhook_info")
+        return WebhookInfo(url=self.webhook_url)
 
 
 class FakeGmailClient:

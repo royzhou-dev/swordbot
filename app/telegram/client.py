@@ -17,7 +17,7 @@ from app.telegram.errors import (
     TelegramRequestError,
     TelegramTemporaryError,
 )
-from app.telegram.schemas import SentMessage, TelegramUser
+from app.telegram.schemas import SentMessage, TelegramUser, WebhookInfo
 
 type ReplyMarkup = dict[str, Any]
 
@@ -45,6 +45,8 @@ class TelegramClient(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     async def delete_webhook(self, *, drop_pending_updates: bool = False) -> None: ...
+
+    async def get_webhook_info(self) -> WebhookInfo: ...
 
 
 class HttpTelegramClient:
@@ -102,6 +104,28 @@ class HttpTelegramClient:
 
     async def delete_webhook(self, *, drop_pending_updates: bool = False) -> None:
         await self._call("deleteWebhook", {"drop_pending_updates": drop_pending_updates})
+
+    async def get_webhook_info(self) -> WebhookInfo:
+        return WebhookInfo.model_validate(await self._call("getWebhookInfo", {}))
+
+    async def set_webhook(
+        self,
+        url: str,
+        *,
+        secret_token: SecretStr,
+        allowed_updates: list[str],
+        drop_pending_updates: bool = False,
+    ) -> None:
+        """Register the production webhook. Only `scripts/telegram_webhook.py` calls it."""
+        await self._call(
+            "setWebhook",
+            {
+                "url": url,
+                "secret_token": secret_token.get_secret_value(),
+                "allowed_updates": allowed_updates,
+                "drop_pending_updates": drop_pending_updates,
+            },
+        )
 
     async def _call(
         self, method: str, params: dict[str, Any], *, http_timeout: float = _DEFAULT_TIMEOUT
@@ -171,4 +195,7 @@ class UnconfiguredTelegramClient:
         raise self._fail()
 
     async def delete_webhook(self, *, drop_pending_updates: bool = False) -> None:
+        raise self._fail()
+
+    async def get_webhook_info(self) -> WebhookInfo:
         raise self._fail()

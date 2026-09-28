@@ -1,7 +1,7 @@
 """Telegram webhook: authenticate, store the update as an event, return 200 (PLAN D1).
 
-Used in production (M7.5). Locally, `scripts/telegram_poll.py` feeds the same
-`ingest_update`.
+Used in production (M7.5; registered with `scripts/telegram_webhook.py set`).
+Locally, `scripts/telegram_poll.py` feeds the same `ingest_update`.
 """
 
 import hmac
@@ -14,13 +14,14 @@ from app.db.session import Database
 from app.events.worker import EventWorker
 from app.logging import get_logger
 from app.telegram.ingest import ingest_update
+from app.telegram.webhook_setup import WEBHOOK_PATH
 
 log = get_logger(__name__)
 
 router = APIRouter()
 
 
-@router.post("/telegram/webhook", include_in_schema=False)
+@router.post(WEBHOOK_PATH, include_in_schema=False)
 async def telegram_webhook(
     request: Request,
     secret: Annotated[str | None, Header(alias="X-Telegram-Bot-Api-Secret-Token")] = None,

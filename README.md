@@ -2,7 +2,7 @@
 
 A personal customer-support assistant. You describe an order problem to a Telegram bot ("My DoorDash order was missing the fries"). The bot works out the details, drafts an email to the merchant's support team, and sends it from your Gmail only after you press **Send**. When support replies, the bot picks the case back up. It asks you before making any consequential decision, such as accepting store credit instead of a refund.
 
-> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer, the intake conversation, and drafting with **[Send] [Edit] [Cancel]** approval exist. Tell the bot about an order problem, answer its questions, and it shows you the email it would send. Press Send and it goes out from your Gmail (see [Gmail setup](#gmail-setup)). Phase 1 is complete. Replies aren't read yet, so they arrive only in your inbox. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
+> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer, the intake conversation, and drafting with **[Send] [Edit] [Cancel]** approval exist. Tell the bot about an order problem, answer its questions, and it shows you the email it would send. Press Send and it goes out from your Gmail (see [Gmail setup](#gmail-setup)). Phase 1 is complete, and the bot deploys to Railway (see [Deployment](#deployment)). Replies aren't read yet, so they arrive only in your inbox. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
 ## Architecture
 
@@ -60,7 +60,7 @@ Every input becomes a row in `events` first: Telegram updates and Gmail notifica
 - **Duplicates are dropped.** `(source, external_id)` is unique, so a redelivered Telegram update or Gmail notification is ignored.
 - **One at a time per user, in order.** A user's events never run concurrently, and a newer event waits while an older one is retrying. Different users' events run in parallel on Postgres.
 - **Retries.** A failing event is retried with backoff (15s, 30s, 1m, … capped at 30m) for 8 attempts, about 30 minutes, and is then marked `dead` and reported. Errors that can never succeed on retry (`PermanentEventError`, such as an invalid payload) go straight to `dead`.
-- **Crash safety.** A claimed event holds a 5-minute lease. If the process dies, the event is retried once the lease expires. A handler's database writes commit only together with the event being marked done. On a normal shutdown, in-flight events are handed back immediately.
+- **Crash safety.** A claimed event holds a 5-minute lease. If the process dies, the event is retried once the lease expires. A handler's database writes commit only together with the event being marked done. On a normal shutdown (such as a redeploy), in-flight events get `WORKER_SHUTDOWN_GRACE_SECONDS` to finish and are then handed back without counting the attempt.
 - **Scheduling.** Future work is an event with a later `run_at`.
 
 To push a synthetic event while the app is running (it is created for `TELEGRAM_ALLOWED_USER_ID` unless you pass `--telegram-user-id`):
@@ -82,15 +82,16 @@ With SQLite the worker handles one event at a time, and a long handler holds SQL
 | `ENVIRONMENT` | `development`, `test`, or `production`. Production turns on JSON logs and turns off `/docs`. |
 | `LOG_LEVEL` | Standard log level name |
 | `USER_TIMEZONE` | Your IANA timezone, such as `America/Los_Angeles` (default `UTC`). Turns "tonight" or "yesterday" into the right order date |
-| `APP_BASE_URL` | Public HTTPS URL of the deployment, used to register webhooks |
-| `DATABASE_URL` | SQLAlchemy async URL: `postgresql+asyncpg://…`, or `sqlite+aiosqlite:///…` for local development |
+| `APP_BASE_URL` | Public HTTPS URL of the deployment, used to register the Telegram webhook. Required in production |
+| `DATABASE_URL` | Postgres URL. `postgresql://` and `postgres://` (as hosts hand them out) become `postgresql+asyncpg://`, and `sslmode=` becomes asyncpg's `ssl=`. `sqlite+aiosqlite:///…` for local development only |
 | `TEST_DATABASE_URL` | Tests only. A disposable Postgres database; when set, DB tests also run against Postgres |
 | `WORKER_ENABLED` | Run the event worker in the app process (default `true`) |
 | `WORKER_CONCURRENCY` | Events processed at once, across different users (default `4`; always 1 on SQLite) |
-| `WORKER_POLL_INTERVAL_SECONDS` | How often the worker checks for due events (default `1.0`) |
+| `WORKER_POLL_INTERVAL_SECONDS` | How often the worker checks for due events (default `1.0`). Only retries, scheduled events and events queued by another process (such as `scripts/telegram_poll.py`) wait for it; webhook messages wake the worker at once. Railway uses `15`, matching the first retry delay; keep `1.0` locally when polling |
 | `EVENT_MAX_ATTEMPTS` | Attempts before an event is marked `dead` (default `8`) |
 | `EVENT_RETRY_BASE_SECONDS`, `EVENT_RETRY_MAX_SECONDS` | Exponential backoff start and cap (defaults `15` and `1800`) |
 | `EVENT_LEASE_SECONDS` | How long a claimed event may run before it is presumed crashed (default `300`) |
+| `WORKER_SHUTDOWN_GRACE_SECONDS` | On shutdown, how long in-flight events may finish before they are handed back (default `10`). The host's stop timeout must be longer |
 | `OPENAI_API_KEY`, `OPENAI_MODEL` | LLM access and model name (default `gpt-5`) |
 | `OPENAI_TIMEOUT_SECONDS`, `OPENAI_MAX_RETRIES` | Per-request timeout and the SDK's own quick retries (defaults `45` and `1`) |
 | `TELEGRAM_BOT_TOKEN` | Token from @BotFather |
@@ -101,6 +102,8 @@ With SQLite the worker handles one event at a time, and a long handler holds SQL
 | `GOOGLE_REDIRECT_URI` | Loopback address `scripts/gmail_auth.py` listens on during consent (default `http://127.0.0.1:8080/`). Only the script uses it |
 | `GMAIL_REFRESH_TOKEN` | Printed by `scripts/gmail_auth.py`. Without all three Gmail credentials, every send reports "Gmail isn't connected" and nothing goes out |
 | `GMAIL_SENDER_ADDRESS` | Your Gmail address, for the From header (the `gmail.send` scope can't read it). The display name follows each case's signature name. Without it, Gmail fills in From itself |
+
+With `ENVIRONMENT=production` (the Docker image's default) the app refuses to start unless `DATABASE_URL` is Postgres, `APP_BASE_URL` is `https://`, and every Telegram, OpenAI and Gmail setting above is set. The error names the missing settings, never their values.
 
 Secrets are loaded as `SecretStr` and are never logged. Log output also passes through a redaction step (`app/logging.py`).
 
@@ -214,7 +217,7 @@ The bot is its own Telegram account, created with @BotFather. You talk to it fro
 2. Send @BotFather `/setjoingroups`, pick your bot, and choose **Disable**, so nobody can add it to a group. The bot ignores group chats anyway.
 3. Open your bot's chat and press **Start**. A bot can't message you until you do.
 4. Find your numeric Telegram user id: run the poller below with `TELEGRAM_ALLOWED_USER_ID` empty and message the bot. The rejection log line shows `sender_id` (never the message). Put it in `TELEGRAM_ALLOWED_USER_ID`.
-5. Set `TELEGRAM_WEBHOOK_SECRET` to a random string of letters, digits, `_` and `-` (webhook mode only, used from M7.5): `py -3.14 -c "import secrets; print(secrets.token_urlsafe(32))"`.
+5. Set `TELEGRAM_WEBHOOK_SECRET` to a random string of letters, digits, `_` and `-` (webhook mode only, see [Deployment](#deployment)): `py -3.14 -c "import secrets; print(secrets.token_urlsafe(32))"`.
 
 If the token ever leaks, send @BotFather `/revoke` and update `.env`.
 
@@ -225,9 +228,9 @@ uv run uvicorn app.main:app --reload     # terminal 1: API + worker
 uv run python scripts/telegram_poll.py   # terminal 2: Telegram -> events
 ```
 
-The poller deletes any registered webhook first (Telegram refuses polling while one is set) and passes each update through the same code as the webhook. Send the bot a complaint, such as "My DoorDash order tonight was missing the fries", and answer its questions. Try `/cancel` to see the confirmation buttons: a button works once, and pressing another button on the same message afterwards says it is no longer valid.
+The poller passes each update through the same code as the webhook. **Use a separate dev bot locally** once the bot is deployed: Telegram refuses polling while a webhook is set, and removing the webhook would send the deployed bot's messages to your laptop's database. So the poller stops with an error if the bot has a webhook. `--take-over` removes it anyway (pending updates are kept); `scripts/telegram_webhook.py set` gives the bot back to the deployment. Send the bot a complaint, such as "My DoorDash order tonight was missing the fries", and answer its questions. Try `/cancel` to see the confirmation buttons: a button works once, and pressing another button on the same message afterwards says it is no longer valid.
 
-**Production uses the webhook** `POST /telegram/webhook` (set up in M7.5). It is disabled (404) unless `TELEGRAM_WEBHOOK_SECRET` is set, and rejects requests whose `X-Telegram-Bot-Api-Secret-Token` header doesn't match (401).
+**Production uses the webhook** `POST /telegram/webhook`, registered by hand with `scripts/telegram_webhook.py set` (see [Deployment](#deployment)). It is disabled (404) unless `TELEGRAM_WEBHOOK_SECRET` is set, and rejects requests whose `X-Telegram-Bot-Api-Secret-Token` header doesn't match (401).
 
 How it works ([app/telegram/](app/telegram/), PLAN D1, D3 and D10):
 
@@ -238,4 +241,84 @@ How it works ([app/telegram/](app/telegram/), PLAN D1, D3 and D10):
 
 ## Deployment
 
-The app is a container (see `Dockerfile`) that listens on `$PORT`. It needs an always-on process, because the event worker runs in-process (see PLAN D1). Run `alembic upgrade head` as a release step before starting the new version; the image includes the migrations. _Details will be written in M7.5._
+The bot runs on [Railway](https://railway.com) as one always-on container plus a Railway Postgres database (PLAN, open decision 2). Nothing about the app is Railway-specific except [railway.json](railway.json): the image is the plain [Dockerfile](Dockerfile), configured entirely by environment variables, so any host that runs a long-lived container works.
+
+**What the setup relies on:**
+
+- **Always on, exactly one instance.** The event worker runs inside the web process (PLAN D1), so the service must never sleep (`sleepApplication: false`) and runs one replica. During a redeploy the old and new containers briefly overlap. That is safe, because events are claimed with `SKIP LOCKED` and at most one runs per user.
+- **Migrations are a pre-deploy step.** `alembic upgrade head` runs in the new image before it takes traffic, never at app startup. If it fails, the deploy stops and the old version keeps running. The old version is still serving while a migration runs, so **migrations must be backward compatible**: add columns and tables first, and remove them only in a later release.
+- **Graceful shutdown.** Railway sends SIGTERM and waits `drainingSeconds` (30) before killing the container. Uvicorn is PID 1 (`exec` in the Dockerfile), so it gets the signal: it finishes open requests (up to 10s), then the worker gives in-flight events `WORKER_SHUTDOWN_GRACE_SECONDS` (10) and hands the rest back to run again. An email send cut off after its claim is never repeated; the bot asks you to check Gmail's Sent folder (PLAN D14).
+- **Health check.** Railway waits for `GET /health` to answer before switching traffic. It is a liveness check only, with no database check, so a Postgres blip doesn't cause restart loops; the worker backs off on its own. A missing production setting makes startup fail (see [Environment variables](#environment-variables)), so a misconfigured deploy never goes live.
+- **Logs** are JSON (`ENVIRONMENT=production` is the image default), which Railway's log view parses and filters by `level`, `event_id` or `case_id`. Uvicorn's access log is off.
+- **Secrets** are Railway service variables. Seal each secret (variable menu → **Seal**): a sealed value is passed to the app but never shown again in the dashboard or the CLI.
+- **Cost.** The trial's one-time $5 credit covers setup and testing. Running 24/7 needs the Hobby plan ($5 a month including $5 of usage). The free plan's roughly $1 of monthly credit can't keep the service up all month, and when credit runs out Railway stops the service: the bot goes silent, and Telegram drops messages it can't deliver within about a day.
+
+### First deployment (runbook)
+
+You do these steps yourself. They create billable resources and handle production secrets.
+
+**Before you start:** push the repository to GitHub, and **stop the local app and poller**. The production bot is the one you already use; step 8 gives local development its own bot.
+
+1. **Project and database.** At railway.com, sign in with GitHub, then **New Project → Deploy PostgreSQL**. This creates a service named `Postgres`.
+2. **App service.** In the same project, **+ Create → GitHub Repo →** your `swordbot` repository. Railway reads `railway.json` and builds the Dockerfile. The first deploy fails because nothing is configured yet. That's expected.
+3. **Public URL.** App service → **Settings → Networking → Generate Domain**, target port **8000**. You get a `https://<name>.up.railway.app` URL.
+4. **Variables.** App service → **Variables → Raw Editor**, paste the block below and fill it in. The `${{…}}` references are resolved by Railway, so leave them as they are. Use your **production** bot's token, and generate a **new** webhook secret (`py -3.14 -c "import secrets; print(secrets.token_urlsafe(32))"`) and keep it for step 7. Afterwards, seal every secret: the bot token, webhook secret, OpenAI key, Google client secret and Gmail refresh token.
+
+   ```text
+   DATABASE_URL=${{Postgres.DATABASE_URL}}
+   APP_BASE_URL=https://${{RAILWAY_PUBLIC_DOMAIN}}
+   PORT=8000
+   USER_TIMEZONE=America/Los_Angeles
+   LOG_LEVEL=INFO
+   WORKER_POLL_INTERVAL_SECONDS=15
+   OPENAI_API_KEY=
+   OPENAI_MODEL=
+   TELEGRAM_BOT_TOKEN=
+   TELEGRAM_WEBHOOK_SECRET=
+   TELEGRAM_ALLOWED_USER_ID=
+   GOOGLE_CLIENT_ID=
+   GOOGLE_CLIENT_SECRET=
+   GMAIL_REFRESH_TOKEN=
+   GMAIL_SENDER_ADDRESS=
+   ```
+
+   The Gmail refresh token and OpenAI key can be the same ones as in your local `.env`. A 5-second worker poll is enough in production, because webhook messages wake the worker immediately; the poll only picks up retries and scheduled work.
+5. **Check the deploy settings.** App service → **Settings → Deploy** should show pre-deploy command `alembic upgrade head`, healthcheck path `/health`, restart policy *On failure*, and serverless / app sleeping **off**. If Railway ignored a `railway.json` field, set it here. Also turn on **Wait for CI** (under Source), so a push that fails CI is never deployed.
+6. **Deploy.** Save the variables (Railway redeploys), or press **Deploy**. In **Deployments → View logs**, the pre-deploy step shows `Running upgrade … -> 0006`, then the app logs `app_started`. Open `https://<name>.up.railway.app/health` and check that it returns `{"status":"ok"}`.
+7. **Point the bot at it.** In PowerShell, from the repository (the variables override `.env` for this command only):
+
+   ```powershell
+   $env:TELEGRAM_BOT_TOKEN = "<production bot token>"
+   $env:TELEGRAM_WEBHOOK_SECRET = "<the secret from step 4>"
+   $env:APP_BASE_URL = "https://<name>.up.railway.app"
+   uv run python scripts/telegram_webhook.py set
+   Remove-Item Env:TELEGRAM_BOT_TOKEN, Env:TELEGRAM_WEBHOOK_SECRET, Env:APP_BASE_URL
+   ```
+
+   `set` checks `/health` first, then prints what Telegram has registered. `webhook url` should be your URL, with no `last error`. Run `... telegram_webhook.py info` at any time; a `401 Unauthorized` as the last error means the secret here and in Railway differ.
+8. **A separate bot for local development.** Create a second bot with @BotFather (`/newbot`, then `/setjoingroups` → Disable), press **Start** in its chat, and put its token in your local `.env`. From now on `scripts/telegram_poll.py` uses that bot, so it never touches the deployed one. Your local database keeps its cases; production starts empty.
+9. **Spending limit** (after moving to Hobby): **Workspace → Usage → Usage limits**. Set a hard limit such as $10, which is well above this bot's expected $5–10 a month.
+10. **Backups.** If the `Postgres` service has a **Backups** tab on your plan, schedule a daily backup. Otherwise take one by hand now and then, using the `DATABASE_PUBLIC_URL` from the Postgres service's Variables (the dump contains your case data, so keep it private):
+
+    ```powershell
+    docker run --rm postgres:17 pg_dump "<DATABASE_PUBLIC_URL>" > swordbot-backup.sql
+    ```
+
+### Later deploys
+
+Pushing to `main` deploys automatically, after CI passes if **Wait for CI** is on. The pre-deploy step migrates the database, and the health check gates the switch-over. To roll back, redeploy an earlier deployment from **Deployments**. Migrations are **not** rolled back, which is another reason they must stay backward compatible.
+
+To rotate the webhook secret, change `TELEGRAM_WEBHOOK_SECRET` in Railway, wait for the redeploy, then run step 7 again with the new value. Messages that arrive in between are rejected and retried by Telegram, so none are lost.
+
+### Verifying (M7.5)
+
+With the laptop **off**, from your phone:
+
+1. Open `https://<name>.up.railway.app/health` in the phone's browser: `{"status":"ok"}`.
+2. Send the bot a complaint ("My DoorDash order tonight was missing the fries"), answer its questions, and give your own second address as the support email. A draft appears with **[Send] [Edit] [Cancel]**.
+3. Reply "looks good" in text. Nothing is sent; only the button approves.
+4. Press **Send**. The bot confirms what went out and to whom. The email is in your Gmail **Sent** folder, and the second address received it (check spam).
+5. Press **Send** on the same draft again: "no longer valid", and still only one email.
+6. Ask "any news on that email?". It gets a status reply about the sent case and doesn't open a new one.
+7. In Railway, **Redeploy** the app, wait for it to go live, and ask again. The same answer shows the case survived the restart.
+8. Railway logs: `event_done` for the `send_email` event, no `event_dead` or `startup_config_invalid`, and no email text, tokens or keys anywhere in the logs.

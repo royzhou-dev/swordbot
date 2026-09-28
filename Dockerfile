@@ -24,4 +24,9 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PORT=8000
 
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT}"]
+# `exec` makes uvicorn PID 1, so it receives the host's SIGTERM on a redeploy and
+# shuts down gracefully (the worker releases in-flight events). Shutdown takes at
+# most ~10s for open requests plus WORKER_SHUTDOWN_GRACE_SECONDS, so the host's
+# stop timeout must be longer (railway.json: drainingSeconds). No access log: the
+# platform's health checks would flood it, and the app logs every event it takes.
+CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT} --no-access-log --timeout-graceful-shutdown 10"]
