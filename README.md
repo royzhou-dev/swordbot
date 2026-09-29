@@ -241,13 +241,15 @@ How it works ([app/telegram/](app/telegram/), PLAN D1, D3 and D10):
 
 ## Deployment
 
-The bot runs on [Railway](https://railway.com) as one always-on container plus a Railway Postgres database (PLAN, open decision 2). Nothing about the app is Railway-specific except [railway.json](railway.json): the image is the plain [Dockerfile](Dockerfile), configured entirely by environment variables, so any host that runs a long-lived container works.
+The bot runs on [Railway](https://railway.com) as one always-on container plus a Railway Postgres database (PLAN, open decision 2). Nothing in the repository is Railway-specific: the image is the plain [Dockerfile](Dockerfile), configured entirely by environment variables, and the few Railway settings are entered in its dashboard (runbook steps 4 and 5). Any host that runs a long-lived container works.
+
+There is no `railway.json`. Railway deprecated Config as Code (new services can't opt in since 2026-08-28, and existing files stop working on 2026-12-01). Its replacement, Infrastructure as Code (`.railway/railway.ts`, applied with the Railway CLI), is more machinery than one service needs.
 
 **What the setup relies on:**
 
-- **Always on, exactly one instance.** The event worker runs inside the web process (PLAN D1), so the service must never sleep (`sleepApplication: false`) and runs one replica. During a redeploy the old and new containers briefly overlap. That is safe, because events are claimed with `SKIP LOCKED` and at most one runs per user.
+- **Always on, exactly one instance.** The event worker runs inside the web process (PLAN D1), so the service must never sleep (serverless / app sleeping off) and runs one replica. During a redeploy the old and new containers briefly overlap. That is safe, because events are claimed with `SKIP LOCKED` and at most one runs per user.
 - **Migrations are a pre-deploy step.** `alembic upgrade head` runs in the new image before it takes traffic, never at app startup. If it fails, the deploy stops and the old version keeps running. The old version is still serving while a migration runs, so **migrations must be backward compatible**: add columns and tables first, and remove them only in a later release.
-- **Graceful shutdown.** Railway sends SIGTERM and waits `drainingSeconds` (30) before killing the container. Uvicorn is PID 1 (`exec` in the Dockerfile), so it gets the signal: it finishes open requests (up to 10s), then the worker gives in-flight events `WORKER_SHUTDOWN_GRACE_SECONDS` (10) and hands the rest back to run again. An email send cut off after its claim is never repeated; the bot asks you to check Gmail's Sent folder (PLAN D14).
+- **Graceful shutdown.** Railway sends SIGTERM and waits `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` (30; Railway's default is only 3) before killing the container. Uvicorn is PID 1 (`exec` in the Dockerfile), so it gets the signal: it finishes open requests (up to 10s), then the worker gives in-flight events `WORKER_SHUTDOWN_GRACE_SECONDS` (10) and hands the rest back to run again. An email send cut off after its claim is never repeated; the bot asks you to check Gmail's Sent folder (PLAN D14).
 - **Health check.** Railway waits for `GET /health` to answer before switching traffic. It is a liveness check only, with no database check, so a Postgres blip doesn't cause restart loops; the worker backs off on its own. A missing production setting makes startup fail (see [Environment variables](#environment-variables)), so a misconfigured deploy never goes live.
 - **Logs** are JSON (`ENVIRONMENT=production` is the image default), which Railway's log view parses and filters by `level`, `event_id` or `case_id`. Uvicorn's access log is off.
 - **Secrets** are Railway service variables. Seal each secret (variable menu → **Seal**): a sealed value is passed to the app but never shown again in the dashboard or the CLI.
@@ -260,7 +262,7 @@ You do these steps yourself. They create billable resources and handle productio
 **Before you start:** push the repository to GitHub, and **stop the local app and poller**. The production bot is the one you already use; step 8 gives local development its own bot.
 
 1. **Project and database.** At railway.com, sign in with GitHub, then **New Project → Deploy PostgreSQL**. This creates a service named `Postgres`.
-2. **App service.** In the same project, **+ Create → GitHub Repo →** your `swordbot` repository. Railway reads `railway.json` and builds the Dockerfile. The first deploy fails because nothing is configured yet. That's expected.
+2. **App service.** In the same project, **+ Create → GitHub Repo →** your `swordbot` repository. Railway finds the `Dockerfile` at the repository root and builds it. The first deploy fails because nothing is configured yet. That's expected.
 3. **Public URL.** App service → **Settings → Networking → Generate Domain**, target port **8000**. You get a `https://<name>.up.railway.app` URL.
 4. **Variables.** App service → **Variables → Raw Editor**, paste the block below and fill it in. The `${{…}}` references are resolved by Railway, so leave them as they are. Use your **production** bot's token, and generate a **new** webhook secret (`py -3.14 -c "import secrets; print(secrets.token_urlsafe(32))"`) and keep it for step 7. Afterwards, seal every secret: the bot token, webhook secret, OpenAI key, Google client secret and Gmail refresh token.
 
@@ -271,6 +273,7 @@ You do these steps yourself. They create billable resources and handle productio
    USER_TIMEZONE=America/Los_Angeles
    LOG_LEVEL=INFO
    WORKER_POLL_INTERVAL_SECONDS=15
+   RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30
    OPENAI_API_KEY=
    OPENAI_MODEL=
    TELEGRAM_BOT_TOKEN=
@@ -282,8 +285,14 @@ You do these steps yourself. They create billable resources and handle productio
    GMAIL_SENDER_ADDRESS=
    ```
 
-   The Gmail refresh token and OpenAI key can be the same ones as in your local `.env`. A 5-second worker poll is enough in production, because webhook messages wake the worker immediately; the poll only picks up retries and scheduled work.
-5. **Check the deploy settings.** App service → **Settings → Deploy** should show pre-deploy command `alembic upgrade head`, healthcheck path `/health`, restart policy *On failure*, and serverless / app sleeping **off**. If Railway ignored a `railway.json` field, set it here. Also turn on **Wait for CI** (under Source), so a push that fails CI is never deployed.
+   The Gmail refresh token and OpenAI key can be the same ones as in your local `.env`. A 15-second worker poll is enough in production, because webhook messages wake the worker immediately; the poll only picks up retries and scheduled work. `RAILWAY_DEPLOYMENT_DRAINING_SECONDS` is read by Railway, not the app: it gives the old container 30 seconds to shut down gracefully.
+5. **Deploy settings.** App service → **Settings → Deploy**, set:
+   - **Pre-deploy step** (**+ Add pre-deploy step**): `alembic upgrade head`
+   - **Healthcheck Path**: `/health` (timeout 120 seconds, if shown)
+   - **Restart Policy**: *On Failure*, max retries 10
+   - **Serverless** / app sleeping: **off**
+
+   Leave **Custom Start Command** empty (the Dockerfile's `CMD` starts the app) and **Teardown** off (step 4's draining variable handles shutdown). Also turn on **Wait for CI** (under Source), so a push that fails CI is never deployed.
 6. **Deploy.** Save the variables (Railway redeploys), or press **Deploy**. In **Deployments → View logs**, the pre-deploy step shows `Running upgrade … -> 0006`, then the app logs `app_started`. Open `https://<name>.up.railway.app/health` and check that it returns `{"status":"ok"}`.
 7. **Point the bot at it.** In PowerShell, from the repository (the variables override `.env` for this command only):
 
@@ -301,8 +310,10 @@ You do these steps yourself. They create billable resources and handle productio
 10. **Backups.** If the `Postgres` service has a **Backups** tab on your plan, schedule a daily backup. Otherwise take one by hand now and then, using the `DATABASE_PUBLIC_URL` from the Postgres service's Variables (the dump contains your case data, so keep it private):
 
     ```powershell
-    docker run --rm postgres:17 pg_dump "<DATABASE_PUBLIC_URL>" > swordbot-backup.sql
+    docker run --rm -v "${PWD}:/backup" postgres:18 pg_dump "<DATABASE_PUBLIC_URL>" -f /backup/swordbot-backup.sql
     ```
+
+    The image's major version must be at least the server's (Railway runs Postgres 18; `pg_dump` refuses a newer server). `-f` writes the file inside the container: Windows PowerShell's `>` would re-encode the dump as UTF-16, which `psql` can't restore.
 
 ### Later deploys
 

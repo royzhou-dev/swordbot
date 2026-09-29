@@ -21,7 +21,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 | M5 | Tool registry with risk levels + agent runtime + intake conversation | done |
 | M6 | Email drafting + Send/Edit/Cancel approval | done |
 | M7 | Gmail send + thread id stored → `WAITING_FOR_SUPPORT` (**Phase 1 done**) | done (real send verified 2026-09-28) |
-| M7.5 | First cloud deployment | code done (Railway, PLAN D15); awaiting the laptop-off verification in the README |
+| M7.5 | First cloud deployment | done (Railway, PLAN D15; verified 2026-09-29) |
 | M8–M10 | Phase 2: receipt search, multiple Gmail accounts (M8.5), support-contact discovery, inbound email via Pub/Sub | not started |
 | M11–M12 | Phase 3: reply classification, approval policy engine, routine auto-replies | not started |
 | M13–M15 | Phase 4: multi-case routing + `/cases`, follow-ups, resolution tracking | not started |

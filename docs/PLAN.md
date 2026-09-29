@@ -127,11 +127,12 @@ These were decided up front so that every milestone builds on the same foundatio
 - The pattern applies to any future external action that must happen at most once: commit the claim on its own, then act, then record.
 
 ### D15. Deployment (decided in M7.5)
-- **Railway**, Hobby plan after the trial (the free plan's ~$1 monthly credit can't keep an always-on service up). One service built from the plain `Dockerfile`, plus Railway Postgres over the private network. `railway.json` holds the Railway-specific settings: pre-deploy `alembic upgrade head`, health check `/health`, restart on failure, no app sleeping, and `drainingSeconds: 30`. Everything else is environment variables, so moving to Render or Fly.io means one new config file.
+- **Railway**, Hobby plan after the trial (the free plan's ~$1 monthly credit can't keep an always-on service up). One service built from the plain `Dockerfile`, plus Railway Postgres over the private network. The Railway-specific settings are entered in the dashboard (README runbook): pre-deploy `alembic upgrade head`, health check `/health`, restart on failure, no app sleeping, and the service variable `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30`. Everything else is environment variables, so moving to Render or Fly.io means redoing only those few settings.
+- **No config file.** M7.5 first shipped a `railway.json`, but Railway had deprecated Config as Code: services created after 2026-08-28 ignore it, and it stops working for everyone on 2026-12-01. Its replacement (Infrastructure as Code, a `.railway/railway.ts` applied from the CLI) was judged too much machinery for one service, so the file was removed and the dashboard is the source of truth for these settings.
 - Compared: Fly.io (its managed Postgres starts around $38/mo; its defaults of stopping idle machines, 2 machines and a 5s kill timeout each work against D1) and Render (about $13/mo, with truly managed Postgres). Railway was the cheapest always-on option with the least to operate. Its Postgres is a container on a volume, so backups are the owner's job (README runbook).
 - **One instance.** The worker is safe with several (D1), so a redeploy's brief overlap is harmless, but there is no reason to run more than one.
 - **Migrations run before the new version takes traffic, while the old one still serves.** So every migration must be backward compatible with the previous release: add first, remove in a later release. A failed migration stops the deploy. Rollbacks redeploy old code but never downgrade the schema.
-- **Shutdown.** Uvicorn is PID 1 (`exec` in the Dockerfile; under `sh -c` it never got SIGTERM, so the worker was killed without releasing its events). It gets 10s for open requests, then the worker grace; `drainingSeconds` must exceed the sum.
+- **Shutdown.** Uvicorn is PID 1 (`exec` in the Dockerfile; under `sh -c` it never got SIGTERM, so the worker was killed without releasing its events). It gets 10s for open requests, then the worker grace; the draining time must exceed the sum (Railway's default is 3s).
 - **Fail fast on config.** With `ENVIRONMENT=production`, startup refuses a SQLite URL, a non-https `APP_BASE_URL`, or any missing Telegram, OpenAI or Gmail setting, naming the settings, not their values. A misconfigured deploy fails its health check instead of running with Gmail or the webhook silently off.
 - **Database URL.** Hosts give `postgresql://` or `postgres://`; `Settings` rewrites it to `postgresql+asyncpg://` and `sslmode=` to asyncpg's `ssl=`, so the host's variable can be referenced directly.
 - **The webhook is registered by hand** (`scripts/telegram_webhook.py set`, which checks `/health` first), not at app startup, so a local run with the production token can never repoint the bot. The local poller refuses to start while the bot has a webhook (`--take-over` overrides), because deleting it would send production's messages to the laptop's database. Local development uses a separate dev bot.
@@ -266,12 +267,13 @@ Additional rules:
 - Pick a platform (see Open Decisions), set up a managed Postgres, set the Telegram webhook with a secret, and run migrations as a release step.
 - **Verify:** the Phase 1 flow works from a phone with the laptop off.
 - Built as (see D15):
-  - `railway.json`; Dockerfile `CMD` uses `exec` and turns off the access log, with a 10s graceful HTTP shutdown.
+  - Railway settings in the dashboard (the original `railway.json` was dropped; see D15); Dockerfile `CMD` uses `exec` and turns off the access log, with a 10s graceful HTTP shutdown.
   - `app/config.py`: `normalize_database_url`, `WORKER_SHUTDOWN_GRACE_SECONDS` (passed to `worker.stop`), `production_config_errors` / `check_production_config` (run first in the lifespan; raises `ConfigurationError`).
   - `app/telegram/webhook_setup.py` (`WEBHOOK_PATH`, `webhook_url`); `HttpTelegramClient.set_webhook` and `get_webhook_info` (the latter also on the protocol and `WebhookInfo` in schemas); `scripts/telegram_webhook.py info|set|delete`.
   - `run_polling` checks `getWebhookInfo` and raises `WebhookActiveError` unless `take_over`; `scripts/telegram_poll.py --take-over`.
   - Tests: `tests/unit/test_config.py`, `tests/unit/test_telegram_webhook_setup.py`, new client tests, polling guard tests. The image was checked locally: the pre-deploy migration against a `postgresql://` URL, startup refusal with missing settings, the webhook's 401/200, and a clean SIGTERM shutdown.
   - The runbook (resources, variables, webhook, dev bot, spending limit, backups) and the verification checklist are in the README's Deployment section.
+  - Verified 2026-09-29: the README checklist passed from a phone with the laptop off. The one setup snag was a webhook secret mismatch (Telegram's `last error` showed 401), fixed by setting a fresh secret in Railway and re-running `telegram_webhook.py set`.
 
 ---
 
