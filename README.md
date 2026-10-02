@@ -2,7 +2,7 @@
 
 A personal customer-support assistant. You describe an order problem to a Telegram bot ("My DoorDash order was missing the fries"). The bot works out the details, drafts an email to the merchant's support team, and sends it from your Gmail only after you press **Send**. When support replies, the bot picks the case back up. It asks you before making any consequential decision, such as accepting store credit instead of a refund.
 
-> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer, the intake conversation, and drafting with **[Send] [Edit] [Cancel]** approval exist. Tell the bot about an order problem, answer its questions, and it shows you the email it would send. Press Send and it goes out from your Gmail (see [Gmail setup](#gmail-setup)). Phase 1 is complete, and the bot deploys to Railway (see [Deployment](#deployment)). Replies aren't read yet, so they arrive only in your inbox. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
+> Status: early development. The scaffold, the case domain (database, state machine, facts with provenance), the event queue with its worker, the Telegram adapter, the LLM client layer, the intake conversation, and drafting with **[Send] [Edit] [Cancel]** approval exist. Tell the bot about an order problem, answer its questions, and it shows you the email it would send. Press Send and it goes out from your Gmail (see [Gmail setup](#gmail-setup)). Phase 1 is complete, and the bot deploys to Railway (see [Deployment](#deployment)). Phase 2 has started: the bot now looks up the order's receipt in your Gmail instead of asking for the order number (see [Finding the order in Gmail](#finding-the-order-in-gmail)). Replies aren't read yet, so they arrive only in your inbox. See [docs/PLAN.md](docs/PLAN.md) for the roadmap.
 
 ## Architecture
 
@@ -100,7 +100,7 @@ With SQLite the worker handles one event at a time, and a long handler holds SQL
 | `TELEGRAM_API_BASE_URL` | Bot API base URL (default `https://api.telegram.org`) |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Your "Desktop app" OAuth client (see [Gmail setup](#gmail-setup)) |
 | `GOOGLE_REDIRECT_URI` | Loopback address `scripts/gmail_auth.py` listens on during consent (default `http://127.0.0.1:8080/`). Only the script uses it |
-| `GMAIL_REFRESH_TOKEN` | Printed by `scripts/gmail_auth.py`. Without all three Gmail credentials, every send reports "Gmail isn't connected" and nothing goes out |
+| `GMAIL_REFRESH_TOKEN` | Printed by `scripts/gmail_auth.py`. Without all three Gmail credentials, every send reports "Gmail isn't connected" and nothing goes out. A token without the `gmail.readonly` scope (one from before M8) still sends; only receipt lookup is off |
 | `GMAIL_SENDER_ADDRESS` | Your Gmail address, for the From header (the `gmail.send` scope can't read it). The display name follows each case's signature name. Without it, Gmail fills in From itself |
 
 With `ENVIRONMENT=production` (the Docker image's default) the app refuses to start unless `DATABASE_URL` is Postgres, `APP_BASE_URL` is `https://`, and every Telegram, OpenAI and Gmail setting above is set. The error names the missing settings, never their values.
@@ -123,15 +123,16 @@ uv run python scripts/llm_smoke.py
 uv run python scripts/llm_smoke.py --text "Amazon sent me the wrong charger"
 uv run python scripts/llm_smoke.py --intake   # the real intake prompt and IntakeDecision schema
 uv run python scripts/llm_smoke.py --draft    # a draft for a sample case (DraftSupportEmail)
+uv run python scripts/llm_smoke.py --receipt  # reading a sample order email (ReceiptInfo)
 ```
 
-It prints the extracted `ExtractedIssue` (or, with `--intake`, the `IntakeDecision`; with `--draft`, the drafted subject and body) as JSON, or a typed error such as `LLMAuthenticationError: 401: invalid_api_key`.
+It prints the extracted `ExtractedIssue` (or, with `--intake`, the `IntakeDecision`; with `--draft`, the drafted subject and body; with `--receipt`, the `ReceiptInfo`) as JSON, or a typed error such as `LLMAuthenticationError: 401: invalid_api_key`.
 
 ## Intake conversation
 
 Tell the bot what went wrong in plain words. It opens a **case**, records each detail you give as a **fact** tagged with its source (your Telegram message), and asks one short question per turn until it has what it needs. Then the case is **ready to draft**, and the bot drafts the email straight away (see below).
 
-What "what it needs" means is decided in code ([app/agent/policies.py](app/agent/policies.py)), not by the model. Every case needs the kind of problem, a short description, the merchant, what you want done (refund, replacement, ...) and the merchant's **support email address**, which you type in until address lookup arrives (M9). Order problems also need the order (an order number **or** the date you ordered), and for missing, wrong or damaged items, which items.
+What "what it needs" means is decided in code ([app/agent/policies.py](app/agent/policies.py)), not by the model. Every case needs the kind of problem, a short description, the merchant, what you want done (refund, replacement, ...) and the merchant's **support email address**, which you type in until address lookup arrives (M9). Order problems also need the order (an order number **or** the date you ordered), and for missing, wrong or damaged items, which items. The bot looks the order up in your Gmail before asking you for it (next section).
 
 - **One model call per message.** The model returns the facts it found in your message and a proposed next step. Code records the facts, recomputes what's missing and decides: the model's question, a fallback question of its own, or "drafting now". Only code moves a case between "gathering context" and "ready to draft".
 - **No invented details.** Facts are only what you said: the model must quote your words for every detail it records, and a detail whose quote isn't in your message is dropped. An order date needs words that say when ("last night", "on the 23rd"). An order number, support address or name the model reports is dropped unless it appears in your message, a support address must look like one, and an order date must be a real date that isn't in the future.
@@ -139,7 +140,35 @@ What "what it needs" means is decided in code ([app/agent/policies.py](app/agent
 - **Small talk** ("hi", "thanks") gets a short reply and opens no case.
 - **Commands.** `/help` (or `/start`) explains the bot. `/cancel` offers to cancel the case you're working on, with **[Yes, cancel] [Keep it]** buttons. Only the button cancels, and nothing is sent to support.
 
-Under the hood ([app/agent/](app/agent/), [app/tools/](app/tools/), PLAN D11 and D12): each step of the agent is one structured LLM call whose action is one of the tools it's allowed to use. The tool executor enforces each tool's risk level in code. `read_only` and `low_risk_write` tools (so far `ask_user` and `reply_to_user`, which message you, and `draft_support_email`, which saves a draft and shows it to you) can run. `requires_approval` tools need an approval record, and the agent can never supply one: approvals come only from your button presses. The loop is capped at 4 steps per message. The last 20 messages of the case are sent as context. Case facts and tool results go into delimited data blocks, and the prompt tells the model to treat them as data, never as instructions.
+Under the hood ([app/agent/](app/agent/), [app/tools/](app/tools/), PLAN D11 and D12): each step of the agent is one structured LLM call whose action is one of the tools it's allowed to use. The tool executor enforces each tool's risk level in code. `read_only` and `low_risk_write` tools (so far `ask_user` and `reply_to_user`, which message you, `draft_support_email`, which saves a draft and shows it to you, and `search_order_emails` and `read_email`, which look in your mailbox) can run. `requires_approval` tools need an approval record, and the agent can never supply one: approvals come only from your button presses. The loop is capped at 4 steps per message. The last 20 messages of the case are sent as context. Case facts and tool results go into delimited data blocks, and the prompt tells the model to treat them as data, never as instructions.
+
+## Finding the order in Gmail
+
+Once the bot knows the merchant, and you haven't typed an order number, it looks for the order's receipt in your Gmail before asking anything more ([app/agent/receipts.py](app/agent/receipts.py), PLAN D16). You see the result, not the search:
+
+```text
+I found this order in your Gmail:
+
+DoorDash order #DD-48213
+Date: Sep 23, 2026
+Total: $32.81
+Items: Cheeseburger, Garlic Fries, Vanilla Shake
+
+From the email "Order Confirmation for Roy from Burger Palace"
+
+Is this the order you mean?
+[Yes] [No]
+```
+
+- **Yes** records the order number, date, total and items as facts, each sourced to that email (`gmail_receipt`, with its Gmail message id). **No** shows the next-best match, if there is one; after that the bot goes back to asking you. Typing "yes" does nothing: only the buttons count, and nothing from an email is recorded before you press one.
+- **A support address in the receipt is asked about separately** (**[Use it] [No]**), and only if you haven't given one. A `no-reply` address is never offered.
+- **What is searched.** One Gmail query: the merchant's name, receipt words (order, receipt, confirmation, invoice, total), and the days around the order date (or the last 30 days if you gave none), leaving out your Sent mail and the Promotions tab. Code reads up to 10 results and ranks them by how much they look like that merchant's receipt (sender, subject, an order number, a total, the date). Only the best 3 can ever reach the model.
+- **What the model sees.** One email per call, already reduced in code to its visible text: no markup, scripts, links or hidden text, no attachments, at most 6,000 characters. It goes in a delimited data block and the prompt treats it as data, never instructions. The model's answer is then checked against that text: an order number, total, item or address that isn't literally in the email is dropped, and an order date must fit the email's date. So an email can't make the bot record something it doesn't say.
+- **What is kept.** The checked details and the email's Gmail id. The email's text is not stored and never logged.
+- **If the lookup can't run** (Gmail down, read access revoked, or a refresh token from before M8 without the `gmail.readonly` scope), nothing breaks: the bot asks you for the order as before.
+- **Cost.** One model call per email read: usually one per case, three at most.
+
+The same read access settles a send whose outcome is unknown (see [Sending](#sending)): the bot looks for the email in Gmail by its Message-ID before asking you.
 
 ## Drafting and approval
 
@@ -173,7 +202,7 @@ A send never happens twice (PLAN D14). Before calling Gmail, the bot commits a c
 
 - **Gmail accepted it:** the email is `sent`, with Gmail's message and thread ids.
 - **It certainly didn't go out** (Gmail refused it, access was revoked, or Gmail couldn't be reached): the email is `failed` and shown again with fresh buttons. Trying again takes another Send press.
-- **Anything else** (a timeout, a server error, a crash after Gmail may have accepted it): the email is `needs_attention`, and the bot asks you to check Gmail's Sent folder: **[It was sent]** or **[It wasn't sent]**. It never retries on its own.
+- **Anything else** (a timeout, a server error, a crash after Gmail may have accepted it): the bot first looks for the email in your Gmail by the Message-ID it gave it (needs the `gmail.readonly` scope). If it is there, the email is `sent` and you are told so. If it isn't found, that proves nothing (Gmail's search can lag), so the email is `needs_attention` and the bot asks you to check Gmail's Sent folder: **[It was sent]** or **[It wasn't sent]**. It never retries on its own.
 
 If a send gives up before reaching Gmail (say, Gmail was unreachable for half an hour), your next message gets the email offered again. `/cancel` while a send's outcome is unknown cancels the case and warns you the email may already have gone out.
 
@@ -181,25 +210,28 @@ While a case waits for support, a message about it ("any news?") gets a short st
 
 ## Gmail setup
 
-The bot sends from your own Gmail account through the Gmail API, with a refresh token you create once. It asks for one scope:
+The bot uses your own Gmail account through the Gmail API, with a refresh token you create once. It asks for two scopes:
 
-| Scope | Since | What it allows |
-|---|---|---|
-| `https://www.googleapis.com/auth/gmail.send` | M7 | Send email as you. It can't read, search or delete anything in your mailbox |
+| Scope | Since | What it allows | What the bot does with it |
+|---|---|---|---|
+| `https://www.googleapis.com/auth/gmail.send` | M7 | Send email as you | Sends the emails you approve with the Send button |
+| `https://www.googleapis.com/auth/gmail.readonly` | M8 | Search and read your mailbox. It can't change or delete anything | Finds an order's receipt ([above](#finding-the-order-in-gmail)), and checks whether an email it sent went out. From M10, reads support's replies |
 
-M8 will add `gmail.readonly` (receipt search, reading replies). You'll have to run the script again then.
+`gmail.readonly` is one of Google's "restricted" scopes. For a personal, unverified app that changes nothing except the wording of the consent warning. The privacy policy linked from the consent screen ([site/privacy.html](site/privacy.html)) describes exactly this use; keep it accurate when the use changes.
+
+**Upgrading a token from before M8.** The old token keeps sending; receipt lookup stays off until you replace it. Run step 4 again (tick both permissions), put the new `GMAIL_REFRESH_TOKEN` in `.env` and in your host's variables, and check it with `--check`. The deploy and the token swap can happen in either order.
 
 1. In the [Google Cloud console](https://console.cloud.google.com/), create a project (or pick one), open **APIs & Services → Library**, and enable the **Gmail API**.
 2. Set up the **OAuth consent screen** (Google Auth Platform): user type **External**, any app name, your address as the contact. Google only publishes an app whose **Branding** has a home page URL and a privacy policy URL, with their domain under **Authorized domains**. This repo publishes both from [site/](site/) to GitHub Pages (`.github/workflows/pages.yml`; enable it once under **Settings → Pages → Source: GitHub Actions**): home page `https://royzhou-dev.github.io/swordbot/`, privacy policy `https://royzhou-dev.github.io/swordbot/privacy.html`, authorized domain `royzhou-dev.github.io`. Leave the logo empty, since a logo makes Google require verification. Then, under **Audience**, press **Publish app** so its status is **In production**. This matters: in **Testing**, Google expires refresh tokens after 7 days and sends start failing with "Gmail isn't connected". The app stays unverified, which is fine for personal use. Google shows a "Google hasn't verified this app" warning during consent; continue through **Advanced**.
 3. Under **Credentials**, create an **OAuth client ID** of type **Desktop app**. Put its id and secret in `.env` as `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
-4. Run the consent flow and allow sending:
+4. Run the consent flow and allow both permissions (sending, and reading):
 
    ```bash
    uv run python scripts/gmail_auth.py          # opens the browser; --no-browser prints the URL
    ```
 
-   Sign in with the account the bot should send from. The script listens on `GOOGLE_REDIRECT_URI` (default `http://127.0.0.1:8080/`) for Google's redirect, exchanges the code (with PKCE), and prints `GMAIL_REFRESH_TOKEN=...`. Put that line in `.env`, or in your host's secrets in production. It is as sensitive as a password for sending mail as you.
-5. Set `GMAIL_SENDER_ADDRESS` to the same address, then check the setup. This sends nothing:
+   Sign in with the account the bot should use. The script listens on `GOOGLE_REDIRECT_URI` (default `http://127.0.0.1:8080/`) for Google's redirect, exchanges the code (with PKCE), and prints `GMAIL_REFRESH_TOKEN=...`. Put that line in `.env`, or in your host's secrets in production. It is as sensitive as a password: it can read your mail and send as you.
+5. Set `GMAIL_SENDER_ADDRESS` to the same address, then check the setup. This sends and reads nothing, and says which of the two scopes the token has:
 
    ```bash
    uv run python scripts/gmail_auth.py --check
@@ -207,7 +239,7 @@ M8 will add `gmail.readonly` (receipt search, reading replies). You'll have to r
 
 6. Restart the app. For a first real test, give the bot a second address of your own as the support email.
 
-To disconnect, remove the app at [myaccount.google.com/permissions](https://myaccount.google.com/permissions). Sends then fail as "Gmail isn't connected" and nothing goes out. Tokens are refreshed with plain HTTPS calls to Google's token endpoint (`app/email/gmail_client.py`); access tokens are kept only in memory and never logged.
+To disconnect, remove the app at [myaccount.google.com/permissions](https://myaccount.google.com/permissions). Sends then fail as "Gmail isn't connected" and nothing goes out; receipt lookup just stops, and the bot asks you for the order instead. Tokens are refreshed with plain HTTPS calls to Google's token endpoint (`app/email/gmail_client.py`); access tokens are kept only in memory and never logged.
 
 ## Telegram bot setup
 
@@ -320,6 +352,16 @@ You do these steps yourself. They create billable resources and handle productio
 Pushing to `main` deploys automatically, after CI passes if **Wait for CI** is on. The pre-deploy step migrates the database, and the health check gates the switch-over. To roll back, redeploy an earlier deployment from **Deployments**. Migrations are **not** rolled back, which is another reason they must stay backward compatible.
 
 To rotate the webhook secret, change `TELEGRAM_WEBHOOK_SECRET` in Railway, wait for the redeploy, then run step 7 again with the new value. Messages that arrive in between are rejected and retried by Telegram, so none are lost.
+
+### Verifying receipt lookup (M8)
+
+After deploying M8 and replacing `GMAIL_REFRESH_TOKEN` with one that has both scopes:
+
+1. `uv run python scripts/gmail_auth.py --check` reports both scopes.
+2. Tell the bot about a real recent order without its number ("My DoorDash order last night was missing the fries"). It answers with the order it found and **[Yes] [No]**, not with a question about the order.
+3. Type "yes". Nothing is recorded; it asks you to use the buttons. Press **Yes**: it moves on to the next missing detail, and the draft later names the order number.
+4. Start another case for a merchant with no email in your inbox: it says it couldn't find the order and asks.
+5. Logs: `order_emails_searched` and `receipt_read` lines with counts only, and no subjects, senders or email text anywhere.
 
 ### Verifying (M7.5)
 

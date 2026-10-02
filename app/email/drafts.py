@@ -243,12 +243,19 @@ async def mark_sent(
     gmail_message_id: str,
     gmail_thread_id: str,
     now: datetime,
+    from_status: OutboundEmailStatus = S.SENDING,
 ) -> bool:
-    """`sending -> sent`, recording Gmail's ids."""
+    """`sending -> sent`, recording Gmail's ids.
+
+    Also from `needs_attention`, when the email was later found in Gmail's
+    Sent folder (M8).
+    """
+    if from_status not in (S.SENDING, S.NEEDS_ATTENTION):
+        raise ValueError(f"an email can't be marked sent from {from_status.value}")
     return await _record(
         session,
         email,
-        S.SENDING,
+        from_status,
         S.SENT,
         now=now,
         gmail_message_id=gmail_message_id,

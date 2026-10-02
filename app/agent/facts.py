@@ -51,7 +51,7 @@ def accept_fact(update: FactUpdate, *, message_text: str, today: date) -> str | 
     normalize the value ("money back" -> "refund"), but it can't record a
     detail the user never mentioned.
     """
-    if _compact(update.quote) not in _compact(message_text):
+    if compact(update.quote) not in compact(message_text):
         return None
     value = update.value.strip()
     match update.key:
@@ -69,7 +69,7 @@ def accept_fact(update: FactUpdate, *, message_text: str, today: date) -> str | 
             return order_date if order_date <= today else None
         case IntakeField.ORDER_NUMBER:
             number = value.lstrip("#").strip()
-            if not number or _compact(number) not in _compact(message_text):
+            if not number or compact(number) not in compact(message_text):
                 return None
             return number
         case IntakeField.SUPPORT_EMAIL:
@@ -82,14 +82,18 @@ def accept_fact(update: FactUpdate, *, message_text: str, today: date) -> str | 
                 return None
             return address
         case IntakeField.SIGNATURE_NAME:
-            if len(value) > MAX_NAME_LENGTH or _compact(value) not in _compact(message_text):
+            if len(value) > MAX_NAME_LENGTH or compact(value) not in compact(message_text):
                 return None
             return value
         case _:
             return value
 
 
-def _compact(text: str) -> str:
+def looks_like_email(address: str) -> bool:
+    return len(address) <= MAX_EMAIL_LENGTH and bool(_EMAIL.match(address))
+
+
+def compact(text: str) -> str:
     """Case-folded, without `#` or whitespace, straight quotes: how typed text is compared."""
     folded = unicodedata.normalize("NFKC", text).casefold().translate(_QUOTES)
     return "".join(ch for ch in folded if ch != "#" and not ch.isspace())

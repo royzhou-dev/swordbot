@@ -30,6 +30,9 @@ class EventType(StrEnum):
     # Send an approved email (M7). Its own event, queued by the Send press, so
     # its claim can commit before Gmail is called (PLAN D14).
     SEND_EMAIL = "send_email"
+    # Look for a case's order receipt in Gmail and read one candidate (M8).
+    # One model call per event, so each stays within the handler's time limit.
+    SEARCH_RECEIPTS = "search_receipts"
 
 
 class EventSource(StrEnum):

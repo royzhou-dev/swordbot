@@ -95,6 +95,7 @@ def test_default_registry_handles_chat_events() -> None:
         EventType.USER_BUTTON_ACTION,
         EventType.DRAFT_EMAIL,
         EventType.SEND_EMAIL,
+        EventType.SEARCH_RECEIPTS,
         EventType.TELEGRAM_OUTBOUND,
     ):
         assert registry.handles(event_type)

@@ -28,7 +28,12 @@ from app.email.errors import (
     GmailUnreachableError,
 )
 from app.email.models import OutboundEmail, OutboundEmailStatus
-from app.email.sending import ANSWER_ABOVE_REPLY, CONFIRMED_SENT_REPLY, SENT_REPLY
+from app.email.sending import (
+    ANSWER_ABOVE_REPLY,
+    CONFIRMED_SENT_REPLY,
+    FOUND_SENT_REPLY,
+    SENT_REPLY,
+)
 from app.events import service as event_service
 from app.events.models import Event, EventSource, EventStatus, EventType
 from app.events.schemas import NewEvent, SendEmailPayload
@@ -55,8 +60,10 @@ async def _case_status(h: Harness) -> CaseStatus:
     return (await h.only_case()).status
 
 
-async def _approve(h: Harness) -> None:
+async def _approve(h: Harness, *, readable: bool = False) -> None:
     await h.reach_draft()
+    # Switched on only for the send, so intake's receipt search stays out of these tests.
+    h.gmail.readable = readable
     await h.press(h.buttons()["Send"])
 
 
@@ -274,6 +281,73 @@ async def test_a_message_while_the_question_is_open_points_to_it(
     assert h.telegram.sent_texts[-1] == ANSWER_ABOVE_REPLY
     assert len(h.llm.calls) == calls_before
     assert await _statuses(h) == [S.NEEDS_ATTENTION]
+
+
+# --- Looking in Gmail before asking (M8) ---------------------------------------------------
+
+
+async def test_an_unknown_outcome_is_settled_by_finding_the_email_in_gmail(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session)
+    # Gmail accepted the email, then the response was lost.
+    h.gmail.accept_then(GmailTemporaryError("read timeout"))
+    await _approve(h, readable=True)
+
+    [email] = await h.emails()
+    assert email.status is S.SENT
+    assert (email.gmail_message_id, email.gmail_thread_id) == ("gmail-msg-1", "gmail-thread-1")
+    # Looked up by the Message-ID the email was given, not by its content.
+    assert email.rfc822_message_id is not None
+    assert h.gmail.searches == [f"rfc822msgid:{email.rfc822_message_id.strip('<>')}"]
+    case = await h.only_case()
+    assert case.status is CaseStatus.WAITING_FOR_SUPPORT
+    assert case.gmail_thread_id == "gmail-thread-1"
+    # The user is told, not asked.
+    assert h.telegram.sent_texts[-1] == FOUND_SENT_REPLY.format(to=SUPPORT, subject=SUBJECT)
+    assert len(h.gmail.sent) == 1
+
+
+async def test_a_send_cut_off_after_gmail_accepted_is_found_on_the_retry(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session, policy=EventPolicy(lease=timedelta(seconds=2)))
+    h.gmail.accept_then(30.0)
+    await _approve(h, readable=True)
+    assert await _statuses(h) == [S.SENDING]
+
+    h.clock.advance(RETRY_LATER)
+    await h.worker.run_until_idle()
+
+    assert await _statuses(h) == [S.SENT]
+    assert await _case_status(h) is CaseStatus.WAITING_FOR_SUPPORT
+    assert len(h.gmail.sent) == 1
+
+
+async def test_not_finding_the_email_proves_nothing_so_the_user_is_asked(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session)
+    h.gmail.fail_send(GmailTemporaryError("read timeout"))
+    await _approve(h, readable=True)
+
+    assert len(h.gmail.searches) == 1
+    assert await _statuses(h) == [S.NEEDS_ATTENTION]
+    assert list(h.buttons()) == ["It was sent", "It wasn't sent"]
+    assert h.gmail.sent == []
+
+
+async def test_a_failed_lookup_asks_the_user(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session)
+    h.gmail.accept_then(GmailTemporaryError("read timeout"))
+    h.gmail.fail_read(GmailTemporaryError("search: HTTP 503"))
+    await _approve(h, readable=True)
+
+    assert await _statuses(h) == [S.NEEDS_ATTENTION]
+    assert list(h.buttons()) == ["It was sent", "It wasn't sent"]
+    assert len(h.gmail.sent) == 1
 
 
 # --- Certainly not sent: offered again ------------------------------------------------------

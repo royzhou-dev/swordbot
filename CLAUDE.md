@@ -22,7 +22,8 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 | M6 | Email drafting + Send/Edit/Cancel approval | done |
 | M7 | Gmail send + thread id stored → `WAITING_FOR_SUPPORT` (**Phase 1 done**) | done (real send verified 2026-09-28) |
 | M7.5 | First cloud deployment | done (Railway, PLAN D15; verified 2026-09-29) |
-| M8–M10 | Phase 2: receipt search, multiple Gmail accounts (M8.5), support-contact discovery, inbound email via Pub/Sub | not started |
+| M8 | Gmail receipt search + Sent-folder check (`gmail.readonly`) | built (PLAN D16); real-Gmail check pending (README "Verifying receipt lookup") |
+| M8.5–M10 | Phase 2: multiple Gmail accounts (M8.5), support-contact discovery, inbound email via Pub/Sub | not started |
 | M11–M12 | Phase 3: reply classification, approval policy engine, routine auto-replies | not started |
 | M13–M15 | Phase 4: multi-case routing + `/cases`, follow-ups, resolution tracking | not started |
 
@@ -48,6 +49,7 @@ Work in order. Build the smallest vertical slice first. Update this table when a
 - **Telegram replies (D10):** handlers never call Telegram. They queue calls through `TelegramOutbox` (`app/telegram/delivery.py`), which become `telegram_outbound` events delivered by the worker.
 - **LLM:** all calls go through `LLMClient` (`app/llm/client.py`): `complete` for text, `extract_structured` for anything that drives the workflow (validated Pydantic output, one repair retry, then a permanent `InvalidAgentDecisionError`). Agent steps are structured `AgentDecision`s, not native function calling (PLAN D11). Requests are stateless with `store=False`. Model names come from env. Only `app/llm/openai_client.py` imports `openai`. Tests use `FakeLLMClient` (`tests/fakes.py`).
 - **Gmail:** send only the minimum email content to the LLM. Parse and trim receipts in code first. Match inbound mail by thread id first, then fall back to headers.
+- **Receipt lookup (D16):** code decides when to search (intake's review hook queues `SEARCH_RECEIPTS`), one model call reads one trimmed email per event, `verify_receipt` drops every value that isn't literally in the email, and nothing from an email becomes a fact before the **[Yes]** press (source `gmail_receipt`). Email text is never stored, logged, or put in `case_messages`. Reading is optional: when `GmailClient.can_read()` is false or Gmail fails, intake asks the user instead.
 - Every table row belongs to a `user_id`, even though v1 is single-user.
 - Keep it a modular monolith. No giant agent class, hidden globals, or premature infrastructure.
 
@@ -78,8 +80,9 @@ uv run python scripts/telegram_webhook.py info|set|delete   # production webhook
 uv run python scripts/llm_smoke.py       # one real ExtractedIssue call to check OPENAI_API_KEY / OPENAI_MODEL
 uv run python scripts/llm_smoke.py --intake   # one real IntakeDecision call (checks the agent schema)
 uv run python scripts/llm_smoke.py --draft    # one real draft for a sample case (checks DraftSupportEmail)
-uv run python scripts/gmail_auth.py      # one-time Gmail OAuth → refresh token
-uv run python scripts/gmail_auth.py --check   # check the configured Gmail credentials (sends nothing)
+uv run python scripts/llm_smoke.py --receipt  # one real read of a sample order email (checks ReceiptInfo)
+uv run python scripts/gmail_auth.py      # one-time Gmail OAuth → refresh token (gmail.send + gmail.readonly)
+uv run python scripts/gmail_auth.py --check   # check the configured Gmail credentials and scopes (sends nothing)
 ```
 
 ## Security & logging
@@ -87,7 +90,7 @@ uv run python scripts/gmail_auth.py --check   # check the configured Gmail crede
 - Never commit secrets. `.env` is gitignored, and `.env.example` holds placeholders only.
 - Never log email bodies, tokens, API keys, auth headers, or payment details. Use structlog with IDs (`event_id`, `case_id`, `user_id`, `gmail_thread_id`) and the redaction processor.
 - Telegram: check the webhook secret header and only accept `TELEGRAM_ALLOWED_USER_ID`. Drop everything else.
-- Gmail scopes are minimal and added one milestone at a time: `gmail.send` (M7), then `gmail.readonly` (M8+). Document every scope in the README. The OAuth consent screen must be "In production", because in "Testing" mode refresh tokens expire after 7 days.
+- Gmail scopes are minimal and added one milestone at a time: `gmail.send` (M7), then `gmail.readonly` (M8). Document every scope in the README, and update `site/privacy.html` before using Google data in a new way. The OAuth consent screen must be "In production", because in "Testing" mode refresh tokens expire after 7 days.
 
 ## Testing
 

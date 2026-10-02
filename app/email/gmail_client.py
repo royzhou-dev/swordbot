@@ -1,10 +1,14 @@
-"""The Gmail boundary: what the send path needs from Gmail (PLAN D4, D14).
+"""The Gmail boundary: sending, and (from M8) reading the mailbox (PLAN D4, D14, D16).
 
-Two calls, split around the send claim. `authorize` makes sure an access token
-is ready and runs *before* the claim, so a token failure can be retried with
-the email still approved. `send` runs after the claim; it must raise the
-typed errors in `app.email.errors`, because the caller decides from them
-whether the email certainly wasn't sent.
+Sending is two calls, split around the send claim. `authorize` makes sure an
+access token is ready and runs *before* the claim, so a token failure can be
+retried with the email still approved. `send` runs after the claim; it must
+raise the typed errors in `app.email.errors`, because the caller decides from
+them whether the email certainly wasn't sent.
+
+Reading (`search`, `get_message`) needs the `gmail.readonly` scope. `can_read`
+says whether the token carries it, so a token from before M8 only switches
+receipt search off and sending keeps working.
 
 `HttpGmailClient` is the real client: a refresh-token grant against Google's
 token endpoint and `users.messages.send`, both plain `httpx` calls (PLAN D6).
@@ -36,12 +40,14 @@ from app.email.errors import (
 from app.logging import get_logger
 
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
+GMAIL_READ_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105 (a URL, not a secret)
 GMAIL_API_BASE_URL = "https://gmail.googleapis.com"
 
 _TOKEN_TIMEOUT = 15.0
 _SEND_TIMEOUT = 30.0
+_READ_TIMEOUT = 10.0
 # Refresh this long before Google's expiry, so a token can't lapse between
 # `authorize` and `send`.
 _REFRESH_MARGIN_SECONDS = 300.0
@@ -52,11 +58,21 @@ _NOT_CONNECTED = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 # A 403 that means the account isn't set up for this call, not that the message was refused.
 _SETUP_REASONS = frozenset({"insufficientPermissions", "accessNotConfigured", "authError"})
 _ERROR_CODE = re.compile(r"[A-Za-z_]{1,64}")
+# Gmail's message ids are hex. Anything else never goes into a URL.
+_MESSAGE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 @dataclass(frozen=True, slots=True)
 class GmailSent:
     """Gmail's ids for an accepted message."""
+
+    message_id: str
+    thread_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class GmailRef:
+    """A message in the mailbox, as a search lists it."""
 
     message_id: str
     thread_id: str
@@ -71,6 +87,18 @@ class GmailClient(Protocol):
         """Send one RFC 822 message from the user's account."""
         ...
 
+    async def can_read(self) -> bool:
+        """Whether the mailbox can be searched and read (the `gmail.readonly` scope)."""
+        ...
+
+    async def search(self, query: str, *, max_results: int) -> list[GmailRef]:
+        """The newest messages matching a Gmail search query."""
+        ...
+
+    async def get_message(self, message_id: str) -> dict[str, Any]:
+        """One message as Gmail's `users.messages` resource (`format=full`)."""
+        ...
+
     async def aclose(self) -> None: ...
 
 
@@ -83,6 +111,15 @@ class UnconfiguredGmailClient:
     async def send(self, raw: bytes) -> GmailSent:
         raise GmailAuthenticationError("Gmail is not connected (GMAIL_REFRESH_TOKEN is not set)")
 
+    async def can_read(self) -> bool:
+        return False
+
+    async def search(self, query: str, *, max_results: int) -> list[GmailRef]:
+        raise GmailAuthenticationError("Gmail is not connected (GMAIL_REFRESH_TOKEN is not set)")
+
+    async def get_message(self, message_id: str) -> dict[str, Any]:
+        raise GmailAuthenticationError("Gmail is not connected (GMAIL_REFRESH_TOKEN is not set)")
+
     async def aclose(self) -> None:
         return None
 
@@ -92,6 +129,8 @@ class _AccessToken:
     value: SecretStr
     # On the client's monotonic clock.
     refresh_after: float
+    # The scopes Google says the token carries. None if it didn't say.
+    scopes: frozenset[str] | None
 
 
 class HttpGmailClient:
@@ -113,9 +152,10 @@ class HttpGmailClient:
         self._refresh_token = refresh_token
         self._http = http
         self._token_url = token_url
-        self._send_url = f"{api_base_url.rstrip('/')}/gmail/v1/users/me/messages/send"
+        self._messages_url = f"{api_base_url.rstrip('/')}/gmail/v1/users/me/messages"
+        self._send_url = f"{self._messages_url}/send"
         self._clock = clock
-        self._access: _AccessToken | None = None
+        self._token: _AccessToken | None = None
         # One refresh at a time, however many events want a token.
         self._lock = asyncio.Lock()
 
@@ -146,7 +186,7 @@ class HttpGmailClient:
         status = response.status_code
         reason = _google_error_code(response)
         if status == 401:
-            self._access = None
+            self._token = None
             raise GmailAuthenticationError(f"send: HTTP 401 {reason or ''}".rstrip())
         if status == 403 and reason in _SETUP_REASONS:
             raise GmailAuthenticationError(f"send: HTTP 403 {reason}")
@@ -155,14 +195,70 @@ class HttpGmailClient:
             raise GmailRejectedError(status, reason)
         raise GmailTemporaryError(f"send: HTTP {status}")
 
+    async def can_read(self) -> bool:
+        scopes = (await self._access()).scopes
+        # Google didn't list the scopes: assume so, and let a 403 say otherwise.
+        return scopes is None or GMAIL_READ_SCOPE in scopes
+
+    async def search(self, query: str, *, max_results: int) -> list[GmailRef]:
+        body = await self._get(
+            "search", self._messages_url, {"q": query, "maxResults": max_results}
+        )
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return []
+        return [
+            GmailRef(message_id=message["id"], thread_id=message["threadId"])
+            for message in messages
+            if isinstance(message, dict)
+            and isinstance(message.get("id"), str)
+            and isinstance(message.get("threadId"), str)
+        ]
+
+    async def get_message(self, message_id: str) -> dict[str, Any]:
+        if not _MESSAGE_ID.fullmatch(message_id):
+            raise GmailRejectedError(400, "invalidMessageId")
+        return await self._get("read", f"{self._messages_url}/{message_id}", {"format": "full"})
+
+    async def _get(self, call: str, url: str, params: dict[str, str | int]) -> dict[str, Any]:
+        """A read call. It changes nothing, so a temporary failure can simply be retried."""
+        token = await self._access_token()
+        try:
+            response = await self._http.get(
+                url,
+                params=params,
+                headers={"Authorization": f"Bearer {token.get_secret_value()}"},
+                timeout=_READ_TIMEOUT,
+            )
+        except _NOT_CONNECTED as exc:
+            raise GmailUnreachableError(f"{call}: {type(exc).__name__}") from None
+        except httpx.HTTPError as exc:
+            raise GmailTemporaryError(f"{call}: {type(exc).__name__}") from None
+        if response.is_success:
+            return _json_object(response)
+        status = response.status_code
+        reason = _google_error_code(response)
+        if status == 401:
+            self._token = None
+            raise GmailAuthenticationError(f"{call}: HTTP 401 {reason or ''}".rstrip())
+        if status == 403 and reason in _SETUP_REASONS:
+            # Most often a token from before M8, without the gmail.readonly scope.
+            raise GmailAuthenticationError(f"{call}: HTTP 403 {reason}")
+        if status == 429 or status >= 500:
+            raise GmailTemporaryError(f"{call}: HTTP {status}")
+        raise GmailRejectedError(status, reason)
+
     async def aclose(self) -> None:
         return None
 
     async def _access_token(self) -> SecretStr:
+        return (await self._access()).value
+
+    async def _access(self) -> _AccessToken:
         async with self._lock:
-            if self._access is None or self._clock() >= self._access.refresh_after:
-                self._access = await self._refresh()
-            return self._access.value
+            if self._token is None or self._clock() >= self._token.refresh_after:
+                self._token = await self._refresh()
+            return self._token
 
     async def _refresh(self) -> _AccessToken:
         started = self._clock()
@@ -192,7 +288,8 @@ class HttpGmailClient:
         if not isinstance(value, str) or not value:
             raise GmailTemporaryError("token refresh: no access token in the response")
         scope = body.get("scope")
-        if isinstance(scope, str) and GMAIL_SEND_SCOPE not in scope.split():
+        scopes = frozenset(scope.split()) if isinstance(scope, str) else None
+        if scopes is not None and GMAIL_SEND_SCOPE not in scopes:
             raise GmailAuthenticationError("token refresh: the token lacks the gmail.send scope")
         expires_in = body.get("expires_in")
         lifetime = (
@@ -203,6 +300,7 @@ class HttpGmailClient:
         return _AccessToken(
             value=SecretStr(value),
             refresh_after=started + max(lifetime - _REFRESH_MARGIN_SECONDS, 0.0),
+            scopes=scopes,
         )
 
 

@@ -20,7 +20,9 @@ from app.email.errors import (
     provably_not_sent,
 )
 from app.email.gmail_client import (
+    GMAIL_READ_SCOPE,
     GMAIL_SEND_SCOPE,
+    GmailRef,
     HttpGmailClient,
     UnconfiguredGmailClient,
     build_gmail_client,
@@ -30,6 +32,8 @@ from app.events.errors import PermanentEventError
 TOKEN_URL = "https://oauth.test/token"
 API = "https://gmail.test"
 SEND_URL = f"{API}/gmail/v1/users/me/messages/send"
+MESSAGES_URL = f"{API}/gmail/v1/users/me/messages"
+BOTH_SCOPES = f"{GMAIL_SEND_SCOPE} {GMAIL_READ_SCOPE}"
 REFRESH_TOKEN = "1//refresh-token-value"
 CLIENT_SECRET = "client-secret-value"
 ACCESS_TOKEN = "ya29.access-token-value"
@@ -341,6 +345,150 @@ async def test_a_401_drops_the_token_so_the_next_attempt_refreshes(
 
 
 # --- configuration --------------------------------------------------------------------
+
+
+# --- reading (M8) -----------------------------------------------------------------------
+
+
+async def test_can_read_follows_the_tokens_scopes(
+    client: HttpGmailClient, clock: Clock, respx_mock: respx.MockRouter
+) -> None:
+    route = respx_mock.post(TOKEN_URL)
+    route.side_effect = [_token_response(), _token_response(scope=BOTH_SCOPES)]
+
+    # A token from before M8: sending still works, reading is off.
+    await client.authorize()
+    assert await client.can_read() is False
+
+    clock.now += 4000  # the token expired; the new one has both scopes
+    assert await client.can_read() is True
+
+
+async def test_can_read_without_a_scope_list_assumes_so(
+    client: HttpGmailClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": ACCESS_TOKEN, "expires_in": 3599})
+    )
+
+    assert await client.can_read() is True
+
+
+async def test_search_lists_matching_messages(
+    client: HttpGmailClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.post(TOKEN_URL).mock(return_value=_token_response(scope=BOTH_SCOPES))
+    route = respx_mock.get(MESSAGES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "messages": [
+                    {"id": "18c1", "threadId": "18c0"},
+                    {"id": "18c2", "threadId": "18c2"},
+                    {"id": 5},
+                ],
+                "resultSizeEstimate": 3,
+            },
+        )
+    )
+
+    refs = await client.search('"DoorDash" order', max_results=10)
+
+    assert refs == [GmailRef("18c1", "18c0"), GmailRef("18c2", "18c2")]
+    request = route.calls.last.request
+    assert request.url.params["q"] == '"DoorDash" order'
+    assert request.url.params["maxResults"] == "10"
+    assert request.headers["Authorization"] == f"Bearer {ACCESS_TOKEN}"
+
+
+async def test_a_search_with_no_results_is_empty(
+    client: HttpGmailClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.post(TOKEN_URL).mock(return_value=_token_response(scope=BOTH_SCOPES))
+    respx_mock.get(MESSAGES_URL).mock(
+        return_value=httpx.Response(200, json={"resultSizeEstimate": 0})
+    )
+
+    assert await client.search("rfc822msgid:x@y", max_results=1) == []
+
+
+async def test_get_message_returns_the_full_resource(
+    client: HttpGmailClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.post(TOKEN_URL).mock(return_value=_token_response(scope=BOTH_SCOPES))
+    resource = {"id": "18c1", "threadId": "18c0", "payload": {"mimeType": "text/plain"}}
+    route = respx_mock.get(f"{MESSAGES_URL}/18c1").mock(
+        return_value=httpx.Response(200, json=resource)
+    )
+
+    assert await client.get_message("18c1") == resource
+    assert route.calls.last.request.url.params["format"] == "full"
+
+
+async def test_a_message_id_that_is_not_an_id_never_reaches_the_url(
+    client: HttpGmailClient, respx_mock: respx.MockRouter
+) -> None:
+    with pytest.raises(GmailRejectedError):
+        await client.get_message("../../drafts?x=1")
+
+    assert respx_mock.calls.call_count == 0
+
+
+async def test_reading_without_the_scope_is_an_authentication_error(
+    client: HttpGmailClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.post(TOKEN_URL).mock(return_value=_token_response())
+    respx_mock.get(MESSAGES_URL).mock(
+        return_value=_google_error(403, "insufficientPermissions", "PERMISSION_DENIED")
+    )
+
+    with pytest.raises(GmailAuthenticationError, match="insufficientPermissions") as caught:
+        await client.search("order", max_results=5)
+
+    _no_secrets(caught.value)
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+async def test_a_read_outage_is_temporary(
+    client: HttpGmailClient, respx_mock: respx.MockRouter, status: int
+) -> None:
+    respx_mock.post(TOKEN_URL).mock(return_value=_token_response(scope=BOTH_SCOPES))
+    respx_mock.get(MESSAGES_URL).mock(return_value=httpx.Response(status))
+
+    with pytest.raises(GmailTemporaryError):
+        await client.search("order", max_results=5)
+
+
+async def test_a_read_timeout_is_temporary(
+    client: HttpGmailClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.post(TOKEN_URL).mock(return_value=_token_response(scope=BOTH_SCOPES))
+    respx_mock.get(f"{MESSAGES_URL}/18c1").mock(side_effect=httpx.ReadTimeout("slow"))
+
+    with pytest.raises(GmailTemporaryError) as caught:
+        await client.get_message("18c1")
+
+    _no_secrets(caught.value)
+
+
+async def test_a_deleted_message_is_rejected(
+    client: HttpGmailClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.post(TOKEN_URL).mock(return_value=_token_response(scope=BOTH_SCOPES))
+    respx_mock.get(f"{MESSAGES_URL}/18c1").mock(
+        return_value=_google_error(404, "notFound", "NOT_FOUND")
+    )
+
+    with pytest.raises(GmailRejectedError):
+        await client.get_message("18c1")
+
+
+async def test_the_unconfigured_client_cannot_read() -> None:
+    gmail = UnconfiguredGmailClient()
+
+    assert await gmail.can_read() is False
+    with pytest.raises(GmailAuthenticationError):
+        await gmail.search("order", max_results=1)
 
 
 @pytest.mark.parametrize(

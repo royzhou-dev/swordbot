@@ -5,13 +5,14 @@
 
 Needs GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET from a "Desktop app" OAuth
 client (README, "Gmail setup"). The script opens Google's consent page for the
-`gmail.send` scope only, catches the redirect on the loopback address in
-GOOGLE_REDIRECT_URI (default http://127.0.0.1:8080/), exchanges the code with
-PKCE, and prints the refresh token. Put it in `.env` or your host's secrets;
-never commit it.
+`gmail.send` and `gmail.readonly` scopes, catches the redirect on the loopback
+address in GOOGLE_REDIRECT_URI (default http://127.0.0.1:8080/), exchanges the
+code with PKCE, and prints the refresh token. Put it in `.env` or your host's
+secrets; never commit it.
 
 `--check` refreshes an access token with the configured credentials and
-reports whether it works and carries the `gmail.send` scope. It sends nothing.
+reports whether it works and which of the two scopes it carries. It sends and
+reads nothing.
 """
 
 import argparse
@@ -34,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.config import Settings, get_settings
 from app.email.errors import GmailError
 from app.email.gmail_client import (
+    GMAIL_READ_SCOPE,
     GMAIL_SEND_SCOPE,
     GOOGLE_AUTH_URL,
     GOOGLE_TOKEN_URL,
@@ -90,7 +92,7 @@ def _authorize(settings: Settings, *, open_browser: bool) -> int:
                 "client_id": client_id,
                 "redirect_uri": redirect_uri,
                 "response_type": "code",
-                "scope": GMAIL_SEND_SCOPE,
+                "scope": f"{GMAIL_SEND_SCOPE} {GMAIL_READ_SCOPE}",
                 # Offline access and a fresh consent make Google return a refresh token.
                 "access_type": "offline",
                 "prompt": "consent",
@@ -101,7 +103,8 @@ def _authorize(settings: Settings, *, open_browser: bool) -> int:
         )
     )
 
-    print("Open this page, sign in with the Gmail account the bot sends from, and allow access:")
+    print("Open this page, sign in with the Gmail account the bot uses, and allow both")
+    print("permissions (sending email, and reading it to find order receipts):")
     print(f"\n  {consent_url}\n")
     if open_browser:
         webbrowser.open(consent_url)
@@ -149,6 +152,11 @@ def _authorize(settings: Settings, *, open_browser: bool) -> int:
         )
         return 1
 
+    if GMAIL_READ_SCOPE not in granted:
+        print(
+            "Note: access to read email wasn't granted, so the bot can send but can't look up "
+            "order receipts. Run again and tick both boxes to change that."
+        )
     print("\nDone. Add this line to .env (or your host's secrets). Keep it secret:\n")
     print(f"GMAIL_REFRESH_TOKEN={refresh_token}\n")
     print(
@@ -206,11 +214,19 @@ async def _check(settings: Settings) -> int:
             return 2
         try:
             await gmail.authorize()
+            can_read = await gmail.can_read()
         except GmailError as exc:
             print(f"The refresh token doesn't work: {type(exc).__name__}: {exc}")
             print("If it says invalid_grant, run this script again without --check.")
             return 1
     print("OK: the refresh token works and has the gmail.send scope. Nothing was sent.")
+    if can_read:
+        print("OK: it also has the gmail.readonly scope, so order receipts can be looked up.")
+    else:
+        print(
+            "Note: it lacks the gmail.readonly scope, so receipt lookup is off (sending still "
+            "works). Run this script again without --check to get a token with both."
+        )
     if not settings.gmail_sender_address:
         print("Note: GMAIL_SENDER_ADDRESS is not set, so Gmail will fill in the From header.")
     return 0

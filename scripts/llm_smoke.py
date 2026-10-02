@@ -4,12 +4,15 @@
     uv run python scripts/llm_smoke.py --text "Amazon sent me the wrong charger"
     uv run python scripts/llm_smoke.py --intake
     uv run python scripts/llm_smoke.py --draft
+    uv run python scripts/llm_smoke.py --receipt
 
 Extracts an `ExtractedIssue` from a complaint and prints it. With `--intake`
 it runs the real intake prompt instead and prints the `IntakeDecision`, which
 checks that OpenAI accepts the agent's decision schema. With `--draft` it
 drafts an email for a sample case and prints the `DraftSupportEmail` (the
-subject and body the user would review, before the code-added sign-off). The `llm_call` log
+subject and body the user would review, before the code-added sign-off). With
+`--receipt` it reads a sample order email and prints the `ReceiptInfo` (what
+the app then checks against the email before showing it). The `llm_call` log
 line shows the model, token usage and whether a repair retry was needed. Uses
 OPENAI_API_KEY and OPENAI_MODEL. Each run costs one or two small API calls.
 """
@@ -25,8 +28,13 @@ from pydantic import BaseModel
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.agent.policies import missing_requirements
-from app.agent.prompts import draft_messages, intake_context, intake_messages
-from app.agent.schemas import IntakeDecision
+from app.agent.prompts import (
+    draft_messages,
+    intake_context,
+    intake_messages,
+    receipt_messages,
+)
+from app.agent.schemas import IntakeDecision, ReceiptInfo
 from app.cases.models import CaseFact, FactSource
 from app.config import Settings, get_settings
 from app.llm.client import Message
@@ -86,14 +94,39 @@ def _draft(settings: Settings) -> tuple[list[Message], type[BaseModel]]:
     return draft_messages(today=today, facts=facts), DraftSupportEmail
 
 
-async def _main(text: str, *, intake: bool, draft: bool) -> int:
+SAMPLE_RECEIPT = """Thanks for your order, Sam!
+Order #DD-48213 from Burger Palace
+Placed on {placed} at 7:42 PM
+1x Cheeseburger $12.99
+1x Garlic Fries $5.49
+1x Vanilla Shake $6.50
+Total $32.81
+Something wrong? Contact us (support@doordash.com)"""
+
+
+def _receipt(settings: Settings) -> tuple[list[Message], type[BaseModel]]:
+    """Reading a sample receipt, as the app would after trimming a Gmail message."""
+    yesterday = datetime.now(settings.user_zoneinfo).date() - timedelta(days=1)
+    return receipt_messages(
+        merchant="DoorDash",
+        approximate_date=yesterday,
+        sender="DoorDash <no-reply@doordash.com>",
+        subject="Order Confirmation for Sam from Burger Palace",
+        received_on=yesterday,
+        text=SAMPLE_RECEIPT.format(placed=f"{yesterday:%B} {yesterday.day}, {yesterday.year}"),
+    ), ReceiptInfo
+
+
+async def _main(text: str, *, intake: bool, draft: bool, receipt: bool) -> int:
     settings = get_settings()
     configure_logging(settings.log_level, json_output=False)
     if settings.openai_api_key is None:
         print("error: set OPENAI_API_KEY in .env", file=sys.stderr)
         return 2
 
-    if draft:
+    if receipt:
+        messages, schema = _receipt(settings)
+    elif draft:
         messages, schema = _draft(settings)
     elif intake:
         messages, schema = _intake(text, settings)
@@ -121,5 +154,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--draft", action="store_true", help="draft an email for a sample case (DraftSupportEmail)"
     )
+    parser.add_argument(
+        "--receipt", action="store_true", help="read a sample order email (ReceiptInfo)"
+    )
     args = parser.parse_args()
-    sys.exit(asyncio.run(_main(args.text, intake=args.intake, draft=args.draft)))
+    sys.exit(
+        asyncio.run(_main(args.text, intake=args.intake, draft=args.draft, receipt=args.receipt))
+    )

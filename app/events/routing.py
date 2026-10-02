@@ -4,7 +4,8 @@ from zoneinfo import ZoneInfo
 
 from app.agent.drafting import DraftingAgent
 from app.agent.intake import IntakeAgent
-from app.chat.handlers import UserMessageHandler, handle_button_press
+from app.agent.receipts import ReceiptAgent
+from app.chat.handlers import ButtonPressHandler, UserMessageHandler
 from app.db.session import Database
 from app.email.gmail_client import GmailClient
 from app.email.sending import EmailSender
@@ -13,6 +14,7 @@ from app.events.models import EventType
 from app.events.schemas import (
     ButtonPressPayload,
     DraftEmailPayload,
+    SearchReceiptsPayload,
     SendEmailPayload,
     UserMessagePayload,
 )
@@ -32,14 +34,17 @@ def build_registry(
 ) -> HandlerRegistry:
     """`database` lets the send handler commit its claim on its own (PLAN D14)."""
     drafting = DraftingAgent(llm, timezone=user_timezone)
+    receipts = ReceiptAgent(llm, gmail, timezone=user_timezone)
+    intake = IntakeAgent(llm, timezone=user_timezone, receipts=receipts)
     registry = HandlerRegistry()
     registry.register(
-        EventType.USER_MESSAGE,
-        UserMessagePayload,
-        UserMessageHandler(IntakeAgent(llm, timezone=user_timezone), drafting),
+        EventType.USER_MESSAGE, UserMessagePayload, UserMessageHandler(intake, drafting, gmail)
     )
-    registry.register(EventType.USER_BUTTON_ACTION, ButtonPressPayload, handle_button_press)
+    registry.register(
+        EventType.USER_BUTTON_ACTION, ButtonPressPayload, ButtonPressHandler(receipts)
+    )
     registry.register(EventType.DRAFT_EMAIL, DraftEmailPayload, drafting.draft)
+    registry.register(EventType.SEARCH_RECEIPTS, SearchReceiptsPayload, receipts.search)
     registry.register(
         EventType.SEND_EMAIL,
         SendEmailPayload,

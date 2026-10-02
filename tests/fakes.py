@@ -6,13 +6,14 @@ from collections import defaultdict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from email import message_from_bytes
 from typing import Any, cast
 
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import utcnow
-from app.email.gmail_client import GmailSent
+from app.email.gmail_client import GmailRef, GmailSent
 from app.events.models import EventSource, EventType
 from app.events.schemas import ClaimedEvent
 from app.llm.client import Message
@@ -115,15 +116,26 @@ class FakeGmailClient:
 
     `on_send`, if set, runs at the start of every send, e.g. to check what the
     database looks like at the moment Gmail is called.
+
+    Reading is off unless `readable` is set, like a token without the
+    `gmail.readonly` scope. `inbox` holds Gmail message resources, newest
+    first: a search returns them all (the query is recorded in `searches`),
+    except an `rfc822msgid:` search, which finds what `send` accepted.
+    `fail_read(*errors)` makes the next search or read calls raise.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, readable: bool = False) -> None:
         self.sent: list[bytes] = []
         self.authorize_calls = 0
         self.on_send: Callable[[], Awaitable[None]] | None = None
+        self.readable = readable
+        self.inbox: list[dict[str, Any]] = []
+        self.searches: list[str] = []
+        self.reads: list[str] = []
         self._authorize_errors: list[Exception] = []
         self._send_errors: list[Exception] = []
         self._after_accept: list[Exception | float] = []
+        self._read_errors: list[Exception] = []
 
     def fail_authorize(self, *errors: Exception) -> None:
         self._authorize_errors.extend(errors)
@@ -152,6 +164,36 @@ class FakeGmailClient:
                 raise outcome
             await asyncio.sleep(outcome)
         return GmailSent(message_id=f"gmail-msg-{number}", thread_id=f"gmail-thread-{number}")
+
+    def fail_read(self, *errors: Exception) -> None:
+        self._read_errors.extend(errors)
+
+    async def can_read(self) -> bool:
+        return self.readable
+
+    async def search(self, query: str, *, max_results: int) -> list[GmailRef]:
+        self.searches.append(query)
+        if self._read_errors:
+            raise self._read_errors.pop(0)
+        if query.startswith("rfc822msgid:"):
+            wanted = query.removeprefix("rfc822msgid:")
+            return [
+                GmailRef(message_id=f"gmail-msg-{number}", thread_id=f"gmail-thread-{number}")
+                for number, raw in enumerate(self.sent, start=1)
+                if str(message_from_bytes(raw)["Message-ID"]).strip("<>") == wanted
+            ][:max_results]
+        return [GmailRef(message_id=m["id"], thread_id=m.get("threadId", "t")) for m in self.inbox][
+            :max_results
+        ]
+
+    async def get_message(self, message_id: str) -> dict[str, Any]:
+        self.reads.append(message_id)
+        if self._read_errors:
+            raise self._read_errors.pop(0)
+        for message in self.inbox:
+            if message["id"] == message_id:
+                return message
+        raise AssertionError(f"unknown Gmail message {message_id}")
 
     async def aclose(self) -> None:
         return None

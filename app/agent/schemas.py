@@ -28,6 +28,13 @@ class FinishIntake(StopAction):
     tool: Literal["finish_intake"]
 
 
+class AwaitReceiptSearch(StopAction):
+    """Code's own action, never the model's: the order is being looked up in Gmail (M8).
+
+    The turn says nothing; the search's outcome is the reply.
+    """
+
+
 class FactUpdate(BaseModel):
     key: IntakeField = Field(description="Which fact this is.")
     # Before `value`, so the model quotes the user first and normalizes second.
@@ -102,3 +109,56 @@ class DraftReviewDecision(BaseModel):
         )
     )
     reason: str = Field(description="One short sentence explaining the choice, for debugging.")
+
+
+MAX_RECEIPT_ITEMS = 30
+MAX_RECEIPT_FIELD_LENGTH = 200
+
+
+class ReceiptInfo(BaseModel):
+    """What one email from the user's mailbox says about an order (M8).
+
+    Code checks every value against the email's text before it is shown to
+    the user (`app.agent.receipts.verify_receipt`).
+    """
+
+    is_order_receipt: bool = Field(
+        description=(
+            "True only if the email is a receipt or confirmation for one specific order "
+            "from the merchant being looked for. False for promotions, newsletters, "
+            "account notices and other merchants' emails."
+        )
+    )
+    order_number: str | None = Field(
+        description="The order number, copied character for character. Null if none is shown."
+    )
+    order_date: str | None = Field(
+        description="The date the order was placed, as YYYY-MM-DD. Null if the email doesn't say."
+    )
+    total: str | None = Field(
+        description="The order total as printed, with its currency symbol, e.g. '$32.81'."
+    )
+    items: list[str] = Field(
+        description="The names of the items ordered, each copied from the email. Empty if none."
+    )
+    support_email: str | None = Field(
+        description=(
+            "An email address the email gives for contacting customer support or help. "
+            "Null if there is none; never a no-reply address."
+        )
+    )
+
+    @field_validator("order_number", "order_date", "total", "support_email")
+    @classmethod
+    def _optional_text(cls, value: str | None) -> str | None:
+        value = (value or "").strip()
+        if len(value) > MAX_RECEIPT_FIELD_LENGTH:
+            raise ValueError(f"must be at most {MAX_RECEIPT_FIELD_LENGTH} characters")
+        return value or None
+
+    @field_validator("items")
+    @classmethod
+    def _items(cls, value: list[str]) -> list[str]:
+        if len(value) > MAX_RECEIPT_ITEMS:
+            raise ValueError(f"must have at most {MAX_RECEIPT_ITEMS} items")
+        return [item.strip() for item in value if item.strip()]

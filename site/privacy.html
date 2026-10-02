@@ -13,7 +13,7 @@
 </head>
 <body>
   <h1>swordbot privacy policy</h1>
-  <p><em>Last updated: September 27, 2026</em></p>
+  <p><em>Last updated: October 1, 2026</em></p>
 
   <p>
     swordbot is a personal assistant that its owner runs for their own use. It helps the owner
@@ -22,15 +22,32 @@
   </p>
 
   <h2>Google user data</h2>
+  <p>swordbot requests two Google permissions:</p>
+  <ul>
+    <li>
+      <code>https://www.googleapis.com/auth/gmail.send</code> lets it send email from the
+      owner's Gmail account.
+    </li>
+    <li>
+      <code>https://www.googleapis.com/auth/gmail.readonly</code> lets it search and read the
+      owner's mailbox. It cannot change or delete anything in it.
+    </li>
+  </ul>
   <p>
-    swordbot requests one Google permission:
-    <code>https://www.googleapis.com/auth/gmail.send</code>, which lets it send email from the
-    owner's Gmail account. It cannot read, search, change or delete anything in the mailbox.
+    <strong>Sending.</strong> It sends an email only after the owner has reviewed that exact
+    email (recipient, subject and text) and approved it by pressing a Send button. After a send,
+    it keeps the message and thread identifiers Gmail returns, so the owner can see what was sent.
   </p>
   <p>
-    It sends an email only after the owner has reviewed that exact email (recipient, subject and
-    text) and approved it by pressing a Send button. After a send, it keeps the message and thread
-    identifiers Gmail returns, so the owner can see what was sent.
+    <strong>Reading.</strong> When the owner reports a problem with an order, swordbot searches
+    the mailbox for that merchant's order emails from around the order date, to find the receipt.
+    It reads at most a few of the best matches, never the mailbox as a whole. Each of those
+    emails is reduced by swordbot's own code to its visible text, and that text is sent once to
+    OpenAI to pick out the order number, date, total, items and any customer-support address.
+    The owner is then shown those details and asked whether it is the right order. Only if the
+    owner says yes are they kept, together with the Gmail identifier of the email they came from.
+    The email's text itself is not stored and not logged. swordbot also looks up, by its
+    identifier, an email it sent itself, to confirm that the send went through.
   </p>
   <p>
     swordbot's use and transfer of information received from Google APIs adheres to the
@@ -41,8 +58,9 @@
   <h2>What is stored</h2>
   <p>
     swordbot stores, in its own database: the owner's chat messages about each problem, the
-    details of each case (such as the merchant, order number, order date, items and the resolution
-    wanted), the email drafts, and the emails sent. The Google access credential is kept as a
+    details of each case (such as the merchant, order number, order date, total, items and the
+    resolution wanted, each marked with where it came from), the email drafts, and the emails
+    sent. Emails read from the mailbox are not stored. The Google access credential is kept as a
     secret on the server running swordbot and is never logged.
   </p>
 
@@ -50,11 +68,15 @@
   <ul>
     <li><strong>Telegram</strong> carries the chat between the owner and swordbot.</li>
     <li>
-      <strong>OpenAI</strong> receives the chat messages and case details through its API to
-      help understand the problem and draft the email, under
+      <strong>OpenAI</strong> receives the chat messages, the case details and the trimmed text
+      of the few order emails described above through its API, to help understand the problem,
+      find the order and draft the email, under
       <a href="https://openai.com/policies/api-data-usage-policies">OpenAI's API data policies</a>.
     </li>
-    <li><strong>Google (Gmail)</strong> delivers the emails the owner approves.</li>
+    <li>
+      <strong>Google (Gmail)</strong> delivers the emails the owner approves and answers the
+      mailbox searches.
+    </li>
     <li>The hosting provider that runs swordbot's server and database.</li>
   </ul>
   <p>The data is not sold, not used for advertising, and not shared with anyone else.</p>
@@ -63,17 +85,17 @@
   <p>
     Google access can be revoked at any time at
     <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.
-    swordbot then cannot send anything. The owner can delete swordbot's stored data by deleting
-    its database.
+    swordbot then cannot send or read anything. The owner can delete swordbot's stored data by
+    deleting its database.
   </p>
 
   <h2>Changes</h2>
   <p>
-    If swordbot starts using more Google data (for example, reading order receipts), this policy
-    will be updated before that happens.
+    If swordbot starts using more Google data (for example, following the replies to the emails
+    it sent), this policy will be updated before that happens.
   </p>
 
   <h2>Contact</h2>
-  <p>Questions: <a href="mailto:YOUR-CONTACT-EMAIL">YOUR-CONTACT-EMAIL</a></p>
+  <p>Questions: <a href="mailto:royzhou01@gmail.com">royzhou01@gmail.com</a></p>
 </body>
 </html>

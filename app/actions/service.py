@@ -127,6 +127,20 @@ async def has_open_actions(
     return bool(await open_actions_in_group(session, group_id, user_id=user_id, now=now))
 
 
+async def has_open_kind(
+    session: AsyncSession, case_id: uuid.UUID, kind: ActionKind, *, now: datetime
+) -> bool:
+    """Whether the case has a button of this kind that can still be pressed."""
+    rows = await session.scalars(
+        select(PendingAction).where(
+            PendingAction.case_id == case_id,
+            PendingAction.kind == kind,
+            PendingAction.status == ActionStatus.OPEN,
+        )
+    )
+    return any(a.expires_at is None or a.expires_at > now for a in rows.all())
+
+
 async def supersede_group(session: AsyncSession, group_id: uuid.UUID, *, now: datetime) -> None:
     """Close every open action in the group, e.g. because the prompt no longer applies."""
     await session.execute(

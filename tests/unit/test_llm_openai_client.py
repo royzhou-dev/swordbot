@@ -14,7 +14,7 @@ from openai.lib._pydantic import to_strict_json_schema
 from pydantic import BaseModel, SecretStr
 from structlog.testing import capture_logs
 
-from app.agent.schemas import DraftReviewDecision, IntakeDecision
+from app.agent.schemas import DraftReviewDecision, IntakeDecision, ReceiptInfo
 from app.config import Settings
 from app.events.errors import PermanentEventError
 from app.llm.client import Message, UnconfiguredLLMClient
@@ -353,7 +353,9 @@ def _objects(node: Any) -> Iterator[dict[str, Any]]:
             yield from _objects(item)
 
 
-@pytest.mark.parametrize("schema", [IntakeDecision, DraftReviewDecision, DraftSupportEmail])
+@pytest.mark.parametrize(
+    "schema", [IntakeDecision, DraftReviewDecision, DraftSupportEmail, ReceiptInfo]
+)
 def test_agent_schemas_fit_strict_mode(schema: type[BaseModel]) -> None:
     # PLAN D11: strict mode rejects oneOf, and every field must be required.
     converted = to_strict_json_schema(schema)

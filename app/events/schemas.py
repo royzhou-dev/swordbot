@@ -73,6 +73,18 @@ class SendEmailPayload(BaseModel):
     outbound_email_id: uuid.UUID
 
 
+class SearchReceiptsPayload(BaseModel):
+    """`SEARCH_RECEIPTS`: find the case's order in Gmail and read one candidate email."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    case_id: uuid.UUID
+    # Gmail message ids still to read, best first. None: search the mailbox first.
+    candidates: list[str] | None = None
+    # How many receipts the user has already said No to.
+    rejected: int = 0
+
+
 @dataclass(frozen=True, slots=True)
 class ClaimedEvent:
     """An immutable snapshot of an event the worker has claimed.

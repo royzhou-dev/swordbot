@@ -31,6 +31,13 @@ class ActionKind(StrEnum):
     # After a send whose outcome is unknown (M7): the user checked Gmail's Sent folder.
     CONFIRM_SENT = "confirm_sent"
     CONFIRM_NOT_SENT = "confirm_not_sent"
+    # Under an order found in Gmail (M8): is this the order? The payload holds
+    # the receipt's details, which become case facts only on Yes.
+    CONFIRM_RECEIPT = "confirm_receipt"
+    REJECT_RECEIPT = "reject_receipt"
+    # A support address found in a confirmed receipt: write to it, or not.
+    USE_RECEIPT_CONTACT = "use_receipt_contact"
+    SKIP_RECEIPT_CONTACT = "skip_receipt_contact"
 
 
 class ActionStatus(StrEnum):

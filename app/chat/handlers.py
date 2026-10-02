@@ -4,7 +4,7 @@ A text message is either a command (`/start`, `/help`, `/cancel`), handled
 here in code, or goes where `cases.routing` sends it: the intake conversation
 (`app.agent.intake`) or the review of a draft waiting for approval
 (`app.agent.drafting`). Buttons run through `pending_actions` (PLAN D3);
-`_run_action` has one branch per `ActionKind`.
+`ButtonPressHandler._run` has one branch per `ActionKind`.
 
 Approval is only ever a Send press (Invariant 2): `SEND_EMAIL` is the only
 code that calls `drafts.approve`.
@@ -21,12 +21,14 @@ from app.actions.models import ActionKind, PendingAction
 from app.actions.service import ButtonSpec
 from app.agent.drafting import DraftingAgent
 from app.agent.intake import IntakeAgent
+from app.agent.receipts import ReceiptAgent
 from app.cases import service as case_service
 from app.cases.models import CaseStatus, SupportCase, TransitionActor
 from app.cases.routing import Stage, route_message
 from app.cases.state_machine import CLOSED_STATUSES, transition
 from app.email import drafts, sending
 from app.email.approvals import DraftButtonPayload
+from app.email.gmail_client import GmailClient
 from app.email.models import OutboundEmailStatus
 from app.events import service as event_service
 from app.events.errors import PermanentEventError
@@ -75,9 +77,11 @@ STALE_DRAFT_REPLY = "That draft has changed since. Use the buttons under the lat
 class UserMessageHandler:
     """The `USER_MESSAGE` handler."""
 
-    def __init__(self, intake: IntakeAgent, drafting: DraftingAgent) -> None:
+    def __init__(self, intake: IntakeAgent, drafting: DraftingAgent, gmail: GmailClient) -> None:
         self._intake = intake
         self._drafting = drafting
+        # Only to look up a send whose outcome is unknown (M8).
+        self._gmail = gmail
 
     async def __call__(self, ctx: HandlerContext, payload: UserMessagePayload) -> None:
         outbox = await TelegramOutbox.for_event(ctx)
@@ -109,7 +113,7 @@ class UserMessageHandler:
                 if route.case is None:
                     raise PermanentEventError("an approved stage was routed without a case")
                 await sending.resume_unfinished_send(
-                    _tool_context(ctx, outbox, route.case), route.case
+                    _tool_context(ctx, outbox, route.case), route.case, self._gmail
                 )
             case _:
                 assert_never(route.stage)
@@ -157,23 +161,69 @@ async def _offer_cancel(
     )
 
 
-async def handle_button_press(ctx: HandlerContext, payload: ButtonPressPayload) -> None:
-    outbox = await TelegramOutbox.for_event(ctx)
-    result = await action_service.consume(
-        ctx.session,
-        payload.action_id,
-        user_id=ctx.event.user_id,
-        event_id=ctx.event.id,
-        now=ctx.now,
-    )
-    # Pressed or not, the buttons on that message are done with.
-    if payload.telegram_message_id is not None:
-        await outbox.clear_buttons(payload.telegram_message_id)
-    if not result.accepted or result.action is None:
-        await outbox.answer_callback(payload.callback_query_id, STALE_BUTTON_REPLY)
-        return
-    await outbox.answer_callback(payload.callback_query_id)
-    await _run_action(ctx, outbox, result.action)
+class ButtonPressHandler:
+    """The `USER_BUTTON_ACTION` handler."""
+
+    def __init__(self, receipts: ReceiptAgent) -> None:
+        self._receipts = receipts
+
+    async def __call__(self, ctx: HandlerContext, payload: ButtonPressPayload) -> None:
+        outbox = await TelegramOutbox.for_event(ctx)
+        result = await action_service.consume(
+            ctx.session,
+            payload.action_id,
+            user_id=ctx.event.user_id,
+            event_id=ctx.event.id,
+            now=ctx.now,
+        )
+        # Pressed or not, the buttons on that message are done with.
+        if payload.telegram_message_id is not None:
+            await outbox.clear_buttons(payload.telegram_message_id)
+        if not result.accepted or result.action is None:
+            await outbox.answer_callback(payload.callback_query_id, STALE_BUTTON_REPLY)
+            return
+        await outbox.answer_callback(payload.callback_query_id)
+        await self._run(ctx, outbox, result.action)
+
+    async def _run(
+        self, ctx: HandlerContext, outbox: TelegramOutbox, action: PendingAction
+    ) -> None:
+        case = await _action_case(ctx, action)
+        tools = _tool_context(ctx, outbox, case)
+        match action.kind:
+            case ActionKind.CANCEL_CASE:
+                await _cancel_case(ctx, tools, _require(case, action))
+            case ActionKind.CONFIRM_SENT | ActionKind.CONFIRM_NOT_SENT:
+                case = _require(case, action)
+                email = await drafts.get_email(
+                    ctx.session, _payload_email_id(action), user_id=ctx.event.user_id
+                )
+                if action.kind is ActionKind.CONFIRM_SENT:
+                    await sending.confirm_sent(tools, case, email)
+                else:
+                    await sending.confirm_not_sent(tools, case, email)
+            case ActionKind.KEEP_CASE:
+                await outbox.send_message(KEPT_REPLY)
+                if case is not None and case.status is CaseStatus.WAITING_FOR_USER_APPROVAL:
+                    # Pressing Cancel under the draft closed its Send button.
+                    await ensure_draft_buttons(tools, case)
+            case ActionKind.SEND_EMAIL:
+                await _approve(ctx, tools, _require(case, action), action)
+            case ActionKind.EDIT_DRAFT:
+                await say(tools, EDIT_PROMPT)
+            case ActionKind.CANCEL_DRAFT:
+                await _offer_cancel(ctx, outbox, _require(case, action))
+            case ActionKind.CONFIRM_RECEIPT:
+                await self._receipts.confirm(tools, _require(case, action), action)
+            case ActionKind.REJECT_RECEIPT:
+                await self._receipts.reject(tools, _require(case, action), action)
+            case ActionKind.USE_RECEIPT_CONTACT:
+                await self._receipts.use_contact(tools, _require(case, action), action)
+            case ActionKind.SKIP_RECEIPT_CONTACT:
+                await self._receipts.skip_contact(tools, _require(case, action))
+            case _:
+                # mypy flags any ActionKind without a branch.
+                assert_never(action.kind)
 
 
 def _tool_context(
@@ -187,37 +237,6 @@ def _tool_context(
         outbox=outbox,
         case=case,
     )
-
-
-async def _run_action(ctx: HandlerContext, outbox: TelegramOutbox, action: PendingAction) -> None:
-    case = await _action_case(ctx, action)
-    tools = _tool_context(ctx, outbox, case)
-    match action.kind:
-        case ActionKind.CANCEL_CASE:
-            await _cancel_case(ctx, tools, _require(case, action))
-        case ActionKind.CONFIRM_SENT | ActionKind.CONFIRM_NOT_SENT:
-            case = _require(case, action)
-            email = await drafts.get_email(
-                ctx.session, _payload_email_id(action), user_id=ctx.event.user_id
-            )
-            if action.kind is ActionKind.CONFIRM_SENT:
-                await sending.confirm_sent(tools, case, email)
-            else:
-                await sending.confirm_not_sent(tools, case, email)
-        case ActionKind.KEEP_CASE:
-            await outbox.send_message(KEPT_REPLY)
-            if case is not None and case.status is CaseStatus.WAITING_FOR_USER_APPROVAL:
-                # Pressing Cancel under the draft closed its Send button.
-                await ensure_draft_buttons(tools, case)
-        case ActionKind.SEND_EMAIL:
-            await _approve(ctx, tools, _require(case, action), action)
-        case ActionKind.EDIT_DRAFT:
-            await say(tools, EDIT_PROMPT)
-        case ActionKind.CANCEL_DRAFT:
-            await _offer_cancel(ctx, outbox, _require(case, action))
-        case _:
-            # mypy flags any ActionKind without a branch.
-            assert_never(action.kind)
 
 
 async def _approve(

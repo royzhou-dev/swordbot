@@ -39,6 +39,11 @@ class IntakeField(StrEnum):
     SIGNATURE_NAME = "signature_name"
 
 
+# Facts only a confirmed Gmail receipt records (M8). The user never states
+# them in chat, and nothing requires them; the drafter sees them as context.
+ORDER_TOTAL: Final = "order_total"
+ORDER_ITEMS: Final = "order_items"
+
 # The facts code writes into the email itself: the recipient and the sign-off.
 # Every other fact is stated in the subject and body the model writes, so a
 # change to one of them needs the text rewritten.

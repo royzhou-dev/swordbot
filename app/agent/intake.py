@@ -12,10 +12,18 @@ the message and a proposed action. Code then:
    model wrongly thinks it is done, or, once nothing is missing, a short
    notice and a queued `DRAFT_EMAIL` event (M6). Only code moves the case
    between GATHERING_CONTEXT and READY_TO_DRAFT.
+
+From M8, step 3 is preceded by a lookup: once the merchant is known and the
+order number isn't, the turn says nothing and queues a search of the user's
+Gmail for the receipt (`app.agent.receipts`, PLAN D16), instead of asking for
+something the system can look up itself (Invariant 7). The search's outcome
+is the reply, and `advance` then moves intake on without a model turn.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
+from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel
@@ -23,13 +31,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.drafting import request_draft
 from app.agent.facts import Recorded, accept_fact, missing, record_fact
-from app.agent.policies import FALLBACK_QUESTIONS, IntakeField
+from app.agent.policies import FALLBACK_QUESTIONS, IntakeField, Requirement
 from app.agent.prompts import SentCase, intake_context, intake_messages
 from app.agent.runtime import TurnOutcome, TurnResult, run_turn
-from app.agent.schemas import FinishIntake, IntakeDecision
+from app.agent.schemas import AwaitReceiptSearch, FinishIntake, IntakeDecision
 from app.cases import messages as case_messages
 from app.cases import service as case_service
-from app.cases.models import CaseStatus, MessageRole, SupportCase, TransitionActor
+from app.cases.models import CaseFact, CaseStatus, MessageRole, SupportCase, TransitionActor
 from app.cases.state_machine import transition
 from app.email import drafts
 from app.email.models import OutboundEmailStatus
@@ -49,6 +57,9 @@ NO_CASE_REPLY = (
     "late deliveries or billing mistakes. Tell me what happened and I'll take it from there."
 )
 DRAFTING_NOTICE = "Thanks, I have everything I need. I'm drafting the email to {merchant} now."
+ANSWER_RECEIPT_ABOVE_REPLY = (
+    "Is the order I found above the right one? Please tap Yes or No under it to tell me."
+)
 
 
 def drafting_notice(case: SupportCase) -> str:
@@ -56,10 +67,61 @@ def drafting_notice(case: SupportCase) -> str:
     return DRAFTING_NOTICE.format(merchant=merchant)
 
 
+class ReceiptLookup(Protocol):
+    """What intake needs from the receipt search (`app.agent.receipts.ReceiptAgent`)."""
+
+    async def start(
+        self,
+        session: AsyncSession,
+        case: SupportCase,
+        facts: Mapping[str, CaseFact],
+        *,
+        now: datetime,
+    ) -> bool:
+        """Queue a search for the case's order, if one is worthwhile and none ran yet.
+
+        True means a search was queued, and its outcome will be the reply.
+        """
+        ...
+
+    async def awaiting_answer(
+        self, session: AsyncSession, case: SupportCase, *, now: datetime
+    ) -> bool:
+        """Whether an order found in Gmail is waiting for the user's Yes or No."""
+        ...
+
+
+async def advance(ctx: ToolContext, case: SupportCase, *, preface: str | None = None) -> None:
+    """Move intake on without a model turn, after a lookup or a button press.
+
+    Asks for the first detail still missing, in code's own words, or starts
+    the draft when nothing is. `preface` is said first, in the same message.
+    """
+    still_missing = missing(await case_service.get_current_facts(ctx.session, case))
+    if still_missing:
+        text = FALLBACK_QUESTIONS[still_missing[0]]
+    else:
+        if case.status is CaseStatus.GATHERING_CONTEXT:
+            await transition(
+                ctx.session,
+                case,
+                CaseStatus.READY_TO_DRAFT,
+                reason="all required details collected",
+                actor=TransitionActor.SYSTEM,
+                event_id=ctx.event.id,
+            )
+        text = drafting_notice(case)
+        await request_draft(ctx.session, case, cause_event_id=ctx.event.id, now=ctx.now)
+    await say(ctx, f"{preface} {text}" if preface else text)
+
+
 class IntakeAgent:
-    def __init__(self, llm: LLMClient, *, timezone: ZoneInfo) -> None:
+    def __init__(
+        self, llm: LLMClient, *, timezone: ZoneInfo, receipts: ReceiptLookup | None = None
+    ) -> None:
         self._llm = llm
         self._timezone = timezone
+        self._receipts = receipts
         self._executor = ToolExecutor(chat_tools())
 
     async def handle(
@@ -105,6 +167,7 @@ class IntakeAgent:
             text=text,
             telegram_message_id=telegram_message_id,
             today=today,
+            receipts=self._receipts,
             beside_sent_case=case is None and sent_case is not None,
         )
         if case is not None:
@@ -154,9 +217,12 @@ class _IntakeTurn:
     text: str
     telegram_message_id: int | None
     today: date
+    receipts: ReceiptLookup | None = None
     # No case is routed, but the focused case's email is with support.
     beside_sent_case: bool = False
     facts_changed: bool = False
+    # A Gmail search for the order was queued: its outcome is this turn's reply.
+    searching: bool = False
 
     @property
     def source_ref(self) -> str:
@@ -210,12 +276,30 @@ class _IntakeTurn:
             # Keys only: the values are the user's words.
             self.tools.log.info("intake_facts_dropped", keys=dropped)
 
-        still_missing = missing(await case_service.get_current_facts(self.session, case))
+        facts = await case_service.get_current_facts(self.session, case)
+        if self.receipts is not None and await self.receipts.start(
+            self.session, case, facts, now=self.ctx.now
+        ):
+            # Look the order up before asking anything more (Invariant 7).
+            if case.status is CaseStatus.READY_TO_DRAFT:
+                await self._move(case, CaseStatus.GATHERING_CONTEXT, "looking up the order")
+            self.searching = True
+            return AwaitReceiptSearch()
+
+        still_missing = missing(facts)
         if still_missing:
             if case.status is CaseStatus.READY_TO_DRAFT:
                 await self._move(case, CaseStatus.GATHERING_CONTEXT, "more details needed")
             if isinstance(action, FinishIntake):
                 return AskUser(tool="ask_user", question=FALLBACK_QUESTIONS[still_missing[0]])
+            if (
+                isinstance(action, AskUser)
+                and still_missing[0] is Requirement.ORDER_IDENTIFIER
+                and self.receipts is not None
+                and await self.receipts.awaiting_answer(self.session, case, now=self.ctx.now)
+            ):
+                # The order on screen may answer this: no asking for it meanwhile.
+                return ReplyToUser(tool="reply_to_user", text=ANSWER_RECEIPT_ABOVE_REPLY)
             return action
         # Complete. A chat reply may stand if nothing changed; otherwise finish.
         if (
@@ -227,7 +311,7 @@ class _IntakeTurn:
         return FinishIntake(tool="finish_intake")
 
     async def conclude(self, result: TurnResult) -> None:
-        if result.outcome is TurnOutcome.TOOL_ENDED:
+        if result.outcome is TurnOutcome.TOOL_ENDED or self.searching:
             return
         case = self.tools.case
         if case is None:
