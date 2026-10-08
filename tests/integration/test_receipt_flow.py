@@ -97,7 +97,7 @@ async def test_the_order_is_looked_up_before_anything_is_asked(
     # The model's own question is held back: the lookup's outcome is the reply.
     [found] = h.telegram.sent_texts
     assert found.startswith(FOUND_INTRO)
-    assert "DoorDash order #DD-48213" in found and "$32.81" in found
+    assert "Order from DoorDash\nOrder number: DD-48213" in found and "$32.81" in found
     assert list(h.buttons()) == ["Yes", "No"]
     assert '"DoorDash"' in h.gmail.searches[0]
     # Nothing from the email is a fact yet.

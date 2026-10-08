@@ -1,8 +1,17 @@
 """Reducing Gmail messages to trimmed visible text (M8), on fixture emails."""
 
+import base64
 from datetime import UTC, datetime
 
-from app.email.parsing import MAX_TEXT_CHARS, html_to_text, parse_message, trim_text
+import pytest
+
+from app.email.parsing import (
+    MAX_TEXT_CHARS,
+    html_to_text,
+    parse_message,
+    repair_mojibake,
+    trim_text,
+)
 from tests.gmail_fixtures import (
     DOORDASH_SUPPORT,
     HIDDEN_PREHEADER,
@@ -109,3 +118,63 @@ def test_internal_date_is_read_as_utc() -> None:
     email = parse_message(generic_receipt(received_at=datetime(2026, 1, 2, 3, 4, tzinfo=UTC)))
 
     assert email.received_at == datetime(2026, 1, 2, 3, 4, tzinfo=UTC)
+
+
+# --- Seen in production: garbled characters ("WagWellie\u00c2\u00ae Single \u00c3\u2014 1") ----
+
+TIMES, REGISTERED = chr(0xD7), chr(0xAE)
+ITEM = f"WagWellie{REGISTERED} Single {TIMES} 1"
+
+
+def _single_part(body: bytes, content_type: str) -> dict[str, object]:
+    message = gmail_message(
+        "w1", sender="Wagwear <store@wagwear.example>", subject="Order", plain="x"
+    )
+    message["payload"]["headers"] = [
+        {"name": "Content-Type", "value": content_type},
+        {"name": "Subject", "value": "Order #374886 confirmed"},
+    ]
+    message["payload"]["mimeType"] = content_type.split(";")[0]
+    message["payload"]["body"]["data"] = base64.urlsafe_b64encode(body).decode("ascii")
+    return message
+
+
+def test_utf8_labelled_as_latin1_is_read_as_utf8() -> None:
+    email = parse_message(_single_part(f"<p>{ITEM}</p>".encode(), "text/html; charset=iso-8859-1"))
+
+    assert email.text == ITEM
+
+
+def test_text_garbled_by_the_sender_is_repaired() -> None:
+    # The shop's template already turned UTF-8 into Latin-1 characters, then sent that as UTF-8.
+    garbled = ITEM.encode("utf-8").decode("latin-1")
+    email = parse_message(_single_part(f"<p>{garbled}</p>".encode(), "text/html; charset=utf-8"))
+
+    assert email.text == ITEM
+
+
+def test_real_latin1_text_is_kept() -> None:
+    email = parse_message(
+        _single_part(
+            "<p>Caf\u00e9 cr\u00e8me, 2 \u00d7 3,50 \u20ac</p>".encode("cp1252"),
+            "text/html; charset=windows-1252",
+        )
+    )
+
+    assert email.text == "Caf\u00e9 cr\u00e8me, 2 \u00d7 3,50 \u20ac"
+
+
+def test_mislabelled_latin1_still_reads() -> None:
+    email = parse_message(
+        _single_part("<p>Caf\u00e9</p>".encode("latin-1"), "text/html; charset=utf-8")
+    )
+
+    assert email.text == "Caf\u00e9"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["S\u00e3o Paulo \u00c3 vista", "na\u00efve \u00c2ge", "\u00a9 2026 Wagwear"],
+)
+def test_ordinary_accented_text_is_not_repaired(text: str) -> None:
+    assert repair_mojibake(text) == text

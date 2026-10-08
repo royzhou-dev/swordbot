@@ -27,6 +27,14 @@ _URL = re.compile(r"(?:https?://|www\.)\S+", re.IGNORECASE)
 _INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad\u034f"))
 _SPACES = re.compile("[ \t\u00a0\u2007\u202f]+")
 _CHARSET = re.compile(r"charset\s*=\s*\"?([A-Za-z0-9._-]+)", re.IGNORECASE)
+# UTF-8 that was read as Latin-1 or Windows-1252 somewhere ("WagWellie\u00c2\u00ae" for
+# "WagWellie\u00ae"): a UTF-8 lead byte's character followed by continuation bytes' characters,
+# as either charset shows them.
+_MOJIBAKE = re.compile(
+    "[\u00c2-\u00f4][\u0080-\u00bf\u0152\u0153\u0160\u0161\u0178\u017d\u017e\u0192\u02c6\u02dc"
+    "\u2013\u2014\u2018-\u201a\u201c-\u201e\u2020-\u2022\u2026\u2030\u2039\u203a\u20ac\u2122]+"
+)
+_UTF8_NAMES = frozenset({"utf-8", "utf8"})
 _HIDDEN_STYLE = re.compile(r"display\s*:\s*none|visibility\s*:\s*hidden", re.IGNORECASE)
 
 _SKIPPED_TAGS = frozenset({"script", "style", "head", "title", "noscript", "svg", "template"})
@@ -80,6 +88,25 @@ def html_to_text(html: str) -> str:
     parser.feed(html)
     parser.close()
     return parser.text()
+
+
+def repair_mojibake(text: str) -> str:
+    """Undo UTF-8 that was decoded as Latin-1 or Windows-1252, one run at a time.
+
+    A run is replaced only if its bytes are valid UTF-8, so real accented text is kept.
+    """
+
+    def fix(match: re.Match[str]) -> str:
+        try:
+            return b"".join(_byte(ch) for ch in match.group()).decode("utf-8")
+        except UnicodeError:
+            return match.group()
+
+    return _MOJIBAKE.sub(fix, text)
+
+
+def _byte(ch: str) -> bytes:
+    return bytes([ord(ch)]) if ord(ch) < 256 else ch.encode("cp1252")
 
 
 def trim_text(text: str) -> str:
@@ -167,11 +194,22 @@ def _decode(data: str, content_type: str) -> str:
         raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
     except (binascii.Error, ValueError):
         return ""
-    match = _CHARSET.search(content_type)
+    # Bytes that are valid UTF-8 almost surely are UTF-8, whatever the header claims:
+    # mislabelled charsets are common in shop templates.
     try:
-        return raw.decode(match.group(1) if match else "utf-8", errors="replace")
+        return repair_mojibake(raw.decode("utf-8"))
+    except UnicodeDecodeError:
+        pass
+    match = _CHARSET.search(content_type)
+    charset = match.group(1).lower() if match else "cp1252"
+    if charset in _UTF8_NAMES:
+        # Labelled UTF-8 but isn't: the commonest real charset.
+        charset = "cp1252"
+    try:
+        text = raw.decode(charset, errors="replace")
     except LookupError:
-        return raw.decode("utf-8", errors="replace")
+        text = raw.decode("cp1252", errors="replace")
+    return repair_mojibake(text)
 
 
 def _header(part: dict[str, Any], name: str, *, limit: int | None = MAX_HEADER_CHARS) -> str:
@@ -181,6 +219,7 @@ def _header(part: dict[str, Any], name: str, *, limit: int | None = MAX_HEADER_C
     for header in headers:
         if isinstance(header, dict) and str(header.get("name", "")).lower() == name.lower():
             value = " ".join(str(header.get("value", "")).translate(_INVISIBLE).split())
+            value = repair_mojibake(value)
             return value if limit is None else value[:limit]
     return ""
 

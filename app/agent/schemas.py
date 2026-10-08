@@ -130,7 +130,10 @@ class ReceiptInfo(BaseModel):
         )
     )
     order_number: str | None = Field(
-        description="The order number, copied character for character. Null if none is shown."
+        description=(
+            "The order number, copied character for character, without a label such as "
+            "'Order' or a leading '#'. Null if none is shown."
+        )
     )
     order_date: str | None = Field(
         description="The date the order was placed, as YYYY-MM-DD. Null if the email doesn't say."

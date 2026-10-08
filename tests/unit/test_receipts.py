@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from app.agent.receipts import Receipt, format_receipt, verify_receipt
+from app.agent.receipts import Receipt, clean_item, format_receipt, verify_receipt
 from app.agent.schemas import ReceiptInfo
 from app.email.parsing import ParsedEmail, parse_message
 from app.email.receipts import MAX_CANDIDATES, build_query, rank, score
@@ -254,7 +254,66 @@ def test_the_confirmation_message_shows_only_checked_details() -> None:
 
     text = format_receipt("DoorDash", receipt, candidate)
 
-    assert "DoorDash order #DD-48213" in text
+    assert "Order from DoorDash\nOrder number: DD-48213" in text
+    # No "#": Telegram would turn it into a hashtag link.
+    assert "#" not in text.replace(candidate.subject, "")
     assert "Date: Sep 23, 2026" in text
     assert "Items: Cheeseburger, Garlic Fries, Vanilla Shake" in text
     assert "Total" not in text
+
+
+# --- Seen in production: a label on the number, quantities and line breaks in items -------
+
+
+@pytest.mark.parametrize(
+    ("raw", "number"),
+    [
+        ("Order #374886", "374886"),
+        ("#374886", "374886"),
+        ("order number: A-1 77", "A-1 77"),
+        ("Confirmation No. XZ-9", "XZ-9"),
+        ("ORD-5521", "ORD-5521"),
+        ("112-9984412-7731450", "112-9984412-7731450"),
+    ],
+)
+def test_a_label_copied_with_the_order_number_is_removed(raw: str, number: str) -> None:
+    candidate = _candidate(doordash_receipt()).model_copy(
+        update={"text": f"Your receipt. {raw} total $1.00"}
+    )
+    receipt = verify_receipt(
+        _info(order_number=raw, total="$1.00", items=[]),
+        candidate,
+        today=TODAY,
+        timezone=UTC_ZONE,
+    )
+
+    assert receipt is not None
+    assert receipt.order_number == number
+
+
+TIMES, REGISTERED = chr(0xD7), chr(0xAE)
+
+
+@pytest.mark.parametrize(
+    ("item", "cleaned"),
+    [
+        (
+            f"WagWellie{REGISTERED} Single {TIMES} 1\nPink / XXSH",
+            f"WagWellie{REGISTERED} Single - Pink / XXSH",
+        ),
+        ("1x Garlic Fries $5.49", "Garlic Fries"),
+        ("Cheeseburger x 2", "Cheeseburger"),
+        ("USB-C Charger 65W Qty: 1 $24.99 USD", "USB-C Charger 65W"),
+        ("Box 2x4 lumber", "Box 2x4 lumber"),
+        ("XXL Hoodie", "XXL Hoodie"),
+    ],
+)
+def test_items_keep_name_and_variant_without_quantity_or_price(item: str, cleaned: str) -> None:
+    assert clean_item(item) == cleaned
+
+
+def test_cleaned_items_are_kept_once() -> None:
+    receipt = _verify(_info(items=["1x Garlic Fries", "Garlic Fries $5.49", "Lobster"]))
+
+    assert receipt is not None
+    assert receipt.items == ["Garlic Fries"]

@@ -77,6 +77,16 @@ MAX_ORDER_NUMBER_LENGTH = 128
 MAX_TOTAL_LENGTH = 40
 # An order date further than this from the email's own date is not believed.
 _MAX_DAYS_BEFORE_EMAIL = 45
+# A label the model copied along with the number: "Order #374886", "Order number: A-1".
+_ORDER_LABEL = re.compile(
+    r"^(?:(?:order|confirmation|invoice)\b\s*)?(?:(?:number|num|no|id)\b\.?\s*)?[#:\s]*",
+    re.IGNORECASE,
+)
+# Quantities and prices the model copied along with an item's name.
+_QUANTITY = re.compile(
+    r"(?:^|(?<=\s))(?:qty:?\s*\d+|\d+\s*[x\u00d7]|[x\u00d7]\s*\d+)(?=\s|$)", re.IGNORECASE
+)
+_PRICE = re.compile(r"[$\u20ac\u00a3]\s?\d[\d.,]*(?:\s?(?:USD|EUR|GBP|CAD|AUD))?")
 # Addresses nobody reads.
 _NO_REPLY = re.compile(
     r"^(?:no[-_.]?reply|do[-_.]?not[-_.]?reply|noreply|notifications?|mailer(?:-daemon)?"
@@ -155,13 +165,14 @@ def verify_receipt(
         needle = compact(value)
         return bool(needle) and needle in haystack
 
-    order_number = (info.order_number or "").lstrip("#").strip() or None
+    order_number = _ORDER_LABEL.sub("", info.order_number or "", count=1).strip() or None
     if order_number and (len(order_number) > MAX_ORDER_NUMBER_LENGTH or not shown(order_number)):
         order_number = None
     total = info.total
     if total and (len(total) > MAX_TOTAL_LENGTH or not shown(total)):
         total = None
-    items = [item for item in info.items if shown(item)]
+    items = list(dict.fromkeys(clean_item(item) for item in info.items if shown(item)))
+    items = [item for item in items if item]
     if order_number is None and total is None and not items:
         # Nothing the user could recognize the order by.
         return None
@@ -181,6 +192,16 @@ def verify_receipt(
         items=items,
         support_email=support_email,
     )
+
+
+def clean_item(item: str) -> str:
+    """An item's name and variant on one line, without quantity or price.
+
+    Runs after the item was found in the email, so only ever removes text.
+    """
+    item = " - ".join(line.strip() for line in item.splitlines() if line.strip())
+    item = _QUANTITY.sub(" ", _PRICE.sub(" ", item))
+    return " ".join(item.split()).strip(" -,")
 
 
 def _plausible_date(
@@ -210,10 +231,10 @@ def _plausible_date(
 
 def format_receipt(merchant: str, receipt: Receipt, email: OrderEmailCandidate) -> str:
     """The message asking whether this is the order. Shows only checked details."""
-    title = f"{merchant} order"
+    # No "#" before the number: Telegram would turn it into a hashtag link.
+    lines = [FOUND_INTRO, "", f"Order from {merchant}"]
     if receipt.order_number:
-        title += f" #{receipt.order_number}"
-    lines = [FOUND_INTRO, "", title]
+        lines.append(f"Order number: {receipt.order_number}")
     if receipt.order_date:
         lines.append(f"Date: {_day(receipt.order_date)}")
     if receipt.total:

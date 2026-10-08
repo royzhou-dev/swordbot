@@ -149,7 +149,8 @@ Once the bot knows the merchant, and you haven't typed an order number, it looks
 ```text
 I found this order in your Gmail:
 
-DoorDash order #DD-48213
+Order from DoorDash
+Order number: DD-48213
 Date: Sep 23, 2026
 Total: $32.81
 Items: Cheeseburger, Garlic Fries, Vanilla Shake
