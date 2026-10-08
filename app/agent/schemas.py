@@ -139,7 +139,11 @@ class ReceiptInfo(BaseModel):
         description="The order total as printed, with its currency symbol, e.g. '$32.81'."
     )
     items: list[str] = Field(
-        description="The names of the items ordered, each copied from the email. Empty if none."
+        description=(
+            "The names of the items ordered, each copied from the email: the name only, "
+            "without quantity, size codes or price (e.g. 'Garlic Fries', not "
+            "'1x Garlic Fries $5.49'). Empty if none."
+        )
     )
     support_email: str | None = Field(
         description=(
