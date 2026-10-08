@@ -239,6 +239,13 @@ class ReceiptAgent:
 
     # --- Called by intake ---------------------------------------------------------------
 
+    async def available(self) -> bool:
+        try:
+            return await self._gmail.can_read()
+        except GmailError as exc:
+            log.warning("receipt_search_unavailable", error_type=type(exc).__name__)
+            return False
+
     async def start(
         self,
         session: AsyncSession,
@@ -261,11 +268,7 @@ class ReceiptAgent:
             or Requirement.ORDER_IDENTIFIER not in REQUIRED[issue_type]
         ):
             return False
-        try:
-            if not await self._gmail.can_read():
-                return False
-        except GmailError as exc:
-            log.warning("receipt_search_unavailable", error_type=type(exc).__name__)
+        if not await self.available():
             return False
         key = "".join(ch for ch in merchant.casefold() if ch.isalnum())[:64]
         event_id = await event_service.enqueue(

@@ -54,6 +54,11 @@ starts a new case.
    If the chat shows the user was asked to confirm an order found in their Gmail with \
 Yes/No buttons and they answer in words, use reply_to_user to ask them to tap Yes or No: \
 only the buttons count.
+   The order_lookup block says whether the app can look orders up in the user's Gmail. \
+When it is on, the app searches the user's Gmail for the receipt by itself as soon as the \
+merchant is known: never ask for an order number or date before you know the merchant, \
+and if the user asks you to find the order, say you'll look for it in their Gmail once you \
+know which store it was from. Never claim you can't search their email when it is on.
 3. reason: one short sentence, for debugging.
 
 Write like a helpful person in a chat: short and plain, no bullet points, no promises \
@@ -147,6 +152,13 @@ def render_data_block(name: str, content: str) -> str:
     return f'<data name="{name}">\n{safe}\n</data>'
 
 
+ORDER_LOOKUP_ON = (
+    "On. Once the merchant is known, the app searches the user's Gmail for the order's "
+    "receipt and asks the user to confirm what it finds. Ask for the merchant before any "
+    "order number or date."
+)
+ORDER_LOOKUP_OFF = "Off. The app can't search the user's email; ask the user for the order."
+
 # What the model may tell the user about a sent case. M10 changes it, once replies are read.
 SENT_CASE_STATUS = (
     "The email went out and the case is waiting for support's reply. Replies aren't "
@@ -172,6 +184,7 @@ def intake_context(
     facts: Mapping[str, CaseFact],
     missing: Sequence[Requirement],
     sent: SentCase | None = None,
+    order_lookup: bool = False,
 ) -> str:
     if has_case:
         still_missing = {r.value: DESCRIPTIONS[r] for r in missing}
@@ -184,6 +197,7 @@ def intake_context(
         render_data_block("today", f"{today.isoformat()} ({timezone})"),
         render_data_block("known_facts", _facts_json(facts)),
         render_data_block("still_missing", json.dumps(still_missing, ensure_ascii=False, indent=1)),
+        render_data_block("order_lookup", ORDER_LOOKUP_ON if order_lookup else ORDER_LOOKUP_OFF),
     ]
     if sent is not None:
         summary = {

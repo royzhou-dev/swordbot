@@ -31,7 +31,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.drafting import request_draft
 from app.agent.facts import Recorded, accept_fact, missing, record_fact
-from app.agent.policies import FALLBACK_QUESTIONS, IntakeField, Requirement
+from app.agent.policies import (
+    FALLBACK_QUESTIONS,
+    LOOKUP_MERCHANT_QUESTION,
+    IntakeField,
+    Requirement,
+)
 from app.agent.prompts import SentCase, intake_context, intake_messages
 from app.agent.runtime import TurnOutcome, TurnResult, run_turn
 from app.agent.schemas import AwaitReceiptSearch, FinishIntake, IntakeDecision
@@ -69,6 +74,10 @@ def drafting_notice(case: SupportCase) -> str:
 
 class ReceiptLookup(Protocol):
     """What intake needs from the receipt search (`app.agent.receipts.ReceiptAgent`)."""
+
+    async def available(self) -> bool:
+        """Whether orders can be looked up in Gmail at all (the read scope, Gmail reachable)."""
+        ...
 
     async def start(
         self,
@@ -140,6 +149,7 @@ class IntakeAgent:
         """
         session = ctx.session
         today = ctx.now.astimezone(self._timezone).date()
+        lookup = self._receipts is not None and await self._receipts.available()
         facts = await case_service.get_current_facts(session, case) if case else {}
         history = (
             await case_messages.recent_messages(session, case, limit=HISTORY_LIMIT) if case else []
@@ -151,6 +161,7 @@ class IntakeAgent:
             facts=facts,
             missing=missing(facts),
             sent=await self._sent_summary(session, sent_case) if case is None else None,
+            order_lookup=lookup,
         )
         tools = ToolContext(
             session=session,
@@ -168,6 +179,7 @@ class IntakeAgent:
             telegram_message_id=telegram_message_id,
             today=today,
             receipts=self._receipts,
+            order_lookup=lookup,
             beside_sent_case=case is None and sent_case is not None,
         )
         if case is not None:
@@ -218,6 +230,8 @@ class _IntakeTurn:
     telegram_message_id: int | None
     today: date
     receipts: ReceiptLookup | None = None
+    # Orders can be looked up in Gmail this turn.
+    order_lookup: bool = False
     # No case is routed, but the focused case's email is with support.
     beside_sent_case: bool = False
     facts_changed: bool = False
@@ -290,6 +304,14 @@ class _IntakeTurn:
         if still_missing:
             if case.status is CaseStatus.READY_TO_DRAFT:
                 await self._move(case, CaseStatus.GATHERING_CONTEXT, "more details needed")
+            if (
+                self.order_lookup
+                and still_missing[0] is Requirement.MERCHANT
+                and isinstance(action, AskUser | FinishIntake)
+            ):
+                # The lookup needs the merchant: ask for it, and for nothing else
+                # (the model may ask for the order number, which Gmail can supply).
+                return AskUser(tool="ask_user", question=LOOKUP_MERCHANT_QUESTION)
             if isinstance(action, FinishIntake):
                 return AskUser(tool="ask_user", question=FALLBACK_QUESTIONS[still_missing[0]])
             if (

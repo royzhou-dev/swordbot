@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.intake import ANSWER_RECEIPT_ABOVE_REPLY, drafting_notice
-from app.agent.policies import FALLBACK_QUESTIONS, Requirement
+from app.agent.policies import FALLBACK_QUESTIONS, LOOKUP_MERCHANT_QUESTION, Requirement
 from app.agent.receipts import (
     CHECKING_NEXT_REPLY,
     CONFIRMED_NOTICE,
@@ -442,6 +442,57 @@ async def test_an_order_number_from_the_user_needs_no_lookup(
 
     assert h.telegram.sent_texts == [QUESTION]
     assert h.gmail.searches == []
+
+
+DOG_SHOES = "My order for dog shoes is missing"
+
+
+def _dog_shoes_question() -> dict[str, Any]:
+    """The model skips the merchant and asks for the order number (seen in production)."""
+    return ask(
+        "What's your order number?",
+        issue_type=("not_delivered", "is missing"),
+        issue_summary=("The order for dog shoes is missing.", "order for dog shoes is missing"),
+    )
+
+
+async def test_the_merchant_is_asked_before_the_order_when_gmail_can_be_searched(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = reading_harness(database, session)
+    h.gmail.inbox = []
+    h.llm.script(
+        _dog_shoes_question(),
+        reply("I'll look for it in your Gmail once I know which store it was from."),
+        ask("Anything else?", merchant_name="Chewy"),
+    )
+
+    await h.say(DOG_SHOES)
+
+    # Code replaces the question: the lookup needs the merchant, not the number.
+    assert h.telegram.sent_texts == [LOOKUP_MERCHANT_QUESTION]
+    context = h.llm.calls[0].messages[1].content
+    assert '<data name="order_lookup">\nOn.' in context
+
+    await h.say("Can you find it?")
+    await h.say("It was from Chewy")
+
+    # The merchant starts the lookup; nothing turned up, so the order is asked for.
+    assert '"Chewy"' in h.gmail.searches[0]
+    assert h.telegram.sent_texts[-1] == f"{NOT_FOUND_NOTICE} {ASK_ORDER}"
+
+
+async def test_without_gmail_the_models_question_stands(
+    database: Database, session: AsyncSession, user: User
+) -> None:
+    h = Harness(database, session)  # can't read: a token from before M8
+    h.llm.script(_dog_shoes_question())
+
+    await h.say(DOG_SHOES)
+
+    assert h.telegram.sent_texts == ["What's your order number?"]
+    context = h.llm.calls[0].messages[1].content
+    assert '<data name="order_lookup">\nOff.' in context
 
 
 async def test_a_problem_that_is_not_about_an_order_needs_no_lookup(

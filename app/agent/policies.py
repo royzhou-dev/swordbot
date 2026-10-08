@@ -103,6 +103,13 @@ DESCRIPTIONS: Final[dict[Requirement, str]] = {
     R.SUPPORT_EMAIL: "the merchant's customer-support email address",
 }
 
+# Asked instead of the model's question while the merchant is the first thing
+# missing and the order can be looked up in Gmail (M8): the lookup needs the
+# merchant, so nothing else (such as the order number) may be asked first.
+LOOKUP_MERCHANT_QUESTION: Final = (
+    "Which store or service was the order from? I'll look for the order in your Gmail."
+)
+
 # Asked by code when the LLM doesn't ask for a missing requirement itself.
 FALLBACK_QUESTIONS: Final[dict[Requirement, str]] = {
     R.ISSUE_TYPE: "What went wrong with your order?",

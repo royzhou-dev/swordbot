@@ -144,7 +144,7 @@ Under the hood ([app/agent/](app/agent/), [app/tools/](app/tools/), PLAN D11 and
 
 ## Finding the order in Gmail
 
-Once the bot knows the merchant, and you haven't typed an order number, it looks for the order's receipt in your Gmail before asking anything more ([app/agent/receipts.py](app/agent/receipts.py), PLAN D16). You see the result, not the search:
+Once the bot knows the merchant, and you haven't typed an order number, it looks for the order's receipt in your Gmail before asking anything more. So when it can search, the first thing it asks for after the problem itself is the store, never the order number ([app/agent/receipts.py](app/agent/receipts.py), PLAN D16). You see the result, not the search:
 
 ```text
 I found this order in your Gmail:
